@@ -1,0 +1,126 @@
+name: RSS Radio Automation
+
+on:
+  schedule:
+    # Pick times that fit YOUR morning (times below assume Asia/Tokyo, UTC+9):
+    # the morning run collects announcements published overnight, early enough
+    # that audio generation (~20 min) finishes before you start listening.
+    # Avoid :00/:30 exactly — GitHub's cron is congested there and runs get delayed.
+    - cron: '50 21 * * *'  # 06:50 JST — catches overnight (US daytime) announcements
+    - cron: '15 8 * * *'   # 17:15 JST — catches JP/EU daytime announcements
+  workflow_dispatch:       # manual runs
+
+# Read-only by default; only the job that pushes state.json gets write access.
+permissions:
+  contents: read
+
+# A manual run overlapping a cron run would double-generate the radio and race
+# on the state.json push.
+concurrency:
+  group: rss-radio
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Test
+        run: pytest -q
+
+  run-batch:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write  # needed to push state.json back to the repository
+
+    steps:
+      - name: Check required secrets
+        env:
+          NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          # Fail fast with a readable message instead of an opaque CLI error later.
+          if [ -z "$NOTEBOOKLM_AUTH_JSON" ]; then
+            echo "::error::The NOTEBOOKLM_AUTH_JSON secret is not set. Locally run: notebooklm -p ci login  — then: gh secret set NOTEBOOKLM_AUTH_JSON < ~/.notebooklm/profiles/ci/storage_state.json  (see README Quick start)"
+            exit 1
+          fi
+          if [ -z "$NOTIFY_WEBHOOK_URL" ]; then
+            echo "::warning::The NOTIFY_WEBHOOK_URL secret is not set. The batch will run, but you will get no Slack/Discord notifications — including error reports."
+          fi
+          echo "Secrets OK."
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Do not leave a write token in .git/config while the batch runs:
+          # notebooklm-py is third-party code running in the same process tree
+          # and could read it.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+
+      - name: Install notebooklm-py
+        run: |
+          # The notebooklm command lands in ~/.local/bin.
+          # NEVER add uv's internal venv bin to PATH — it shadows the pip-installed
+          # packages above and makes feedparser/httpx/yaml unimportable.
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          uv tool install "notebooklm-py[browser]==0.8.0"
+
+      - name: Verify environment
+        run: |
+          # Guards against the PATH-shadowing regression described above.
+          python -c "import feedparser, yaml, httpx; print('pip deps OK')"
+          command -v notebooklm
+
+      - name: Run batch script
+        env:
+          NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: python radio_batch.py
+
+      - name: Commit and push state.json if updated
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --staged --quiet; then
+            echo "state.json unchanged. Nothing to push."
+            exit 0
+          fi
+          git commit -m "chore: update state.json [skip ci]"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git pull --rebase "$REMOTE" "${GITHUB_REF_NAME}"
+          git push "$REMOTE" "HEAD:${GITHUB_REF_NAME}"

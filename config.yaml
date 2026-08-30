@@ -1,0 +1,102 @@
+# Feeds to turn into radio. This starter config works as-is — run the workflow once,
+# then replace the feeds with the sources you actually follow.
+#
+# Per-feed keys:
+#   name:        display name used in notifications
+#   url:         RSS/Atom feed URL (or a sitemap.xml URL with `type: sitemap`)
+#   topic:       which daily notebook the articles go to.
+#                One notebook + one audio overview per topic per day; mixing unrelated
+#                topics in one radio makes the conversation incoherent, so split them.
+#   type:        "sitemap" for sites that publish no RSS feed (see the commented example)
+#   source_mode: "text" for hosts whose article pages block NotebookLM's fetcher
+feeds:
+  - name: "GitHub Changelog"
+    url: "https://github.blog/changelog/feed/"
+    topic: "Infra"
+  - name: "Cloudflare"
+    url: "https://blog.cloudflare.com/rss/"
+    topic: "Infra"
+  - name: "Claude Code"
+    url: "https://code.claude.com/docs/en/whats-new/rss.xml"
+    topic: "AI"
+
+  # A site with no RSS feed: point at its sitemap.xml and pick a URL prefix.
+  # Read-state for sitemaps uses a seen-URL set, not a watermark — editing an old
+  # article bumps <lastmod>, and a watermark would resurface it as "new".
+  # See docs/DESIGN.md for the full reasoning.
+  # - name: "Anthropic"
+  #   type: sitemap
+  #   url: "https://www.anthropic.com/sitemap.xml"
+  #   prefix: "https://www.anthropic.com/news/"
+  #   topic: "AI"
+
+  # A host whose article pages return a bot challenge (e.g. Cloudflare's
+  # "Just a moment...") to non-browser clients. NotebookLM's fetcher would store the
+  # challenge page instead of the article. `source_mode: text` submits the RSS
+  # title + summary as a text source instead of the URL, bypassing the fetcher.
+  # The radio then only knows the summary — the source text says so explicitly,
+  # and notifications mark these articles as summary-only.
+  # Deliberately NOT worked around by spoofing a browser User-Agent: that would be
+  # evading someone else's bot protection. This project settles for less content.
+  # - name: "OpenAI"
+  #   url: "https://openai.com/news/rss.xml"
+  #   topic: "AI"
+  #   source_mode: text
+
+# Watch pages for updates (webhook notification only — never turned into radio).
+# Points at a sitemap.xml; notifies when a matching URL appears or its <lastmod>
+# changes. `keywords` filters URL slugs to cut noise (empty = everything under prefix).
+# watch:
+#   - name: "Claude support"
+#     url: "https://support.claude.com/sitemap.xml"
+#     prefix: "https://support.claude.com/en/articles/"
+#     keywords: [pricing, usage, limit]
+
+settings:
+  # {topic} and {date} are filled in, e.g. "Tech Radio AI 2026-08-31".
+  # Cleanup only ever deletes notebooks whose title FULLY matches this format,
+  # so notebooks you create by hand are structurally safe.
+  notebook_title_format: "Tech Radio {topic} {date}"
+
+  # Audio Overview language — any language NotebookLM supports (ja, en, ...).
+  language: "ja"
+
+  # Timezone for notebook dates and monthly checks. GitHub runners are UTC;
+  # without this, a morning run would file articles under yesterday's date.
+  timezone: "Asia/Tokyo"
+
+  # Where articles go when a feed has no `topic`.
+  default_topic: "AI"
+
+  # How many articles per run. Sources are waited on serially, so raising `total`
+  # eats into the workflow's 30-minute timeout. Articles over the limit are NOT
+  # dropped — they stay unread and are processed on the next run, oldest first.
+  limits:
+    per_feed: 3
+    total: 15
+
+  # User-Agent sent when fetching feeds. Point it at your own repository so feed
+  # operators can see who is polling them.
+  # user_agent: "notebooklm-radio/1.0 (+https://github.com/YOU/YOUR-REPO)"
+
+  # Style instructions passed to NotebookLM's Audio Overview customization.
+  # Write them in the same language as `language` for best results.
+  audio:
+    length: "long"
+    prompt: >-
+      対談形式で。各ニュースの表面的な紹介ではなく、「なぜ今このタイミングで出たのか」と
+      開発者の日常に何が変わるかを深掘りすること。件数を網羅するより、重要な話題を
+      選んで掘り下げてよい。
+
+  # Auto-delete old daily notebooks created by this batch.
+  # dry_run: true posts the would-delete list to your webhook INSTEAD of deleting.
+  # Keep it true until you have seen a correct list in your notifications, then
+  # flip it to false.
+  cleanup:
+    enabled: true
+    retention_days: 7
+    dry_run: true
+
+  # On the 1st of each month, report feeds with no new articles for this many days
+  # (catches dead feeds and silently changed site structures).
+  stale_feed_days: 30
