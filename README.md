@@ -59,6 +59,8 @@ Slack and Discord are auto-detected from the URL.
 
 **5. Make it yours** — edit `config.yaml`: swap in your feeds, set `language`, `timezone`, and the audio style prompt. The cron schedule in `.github/workflows/rss-radio.yml` assumes JST mornings; shift it to your timezone.
 
+Don't know which feeds to add? **[tech-feed-catalog](https://inoueuj.github.io/tech-feed-catalog/)** is a companion catalog of continuously validated developer feeds — filter by topic, tick the ones you want, and copy a `config.yaml` block straight into this file. It also marks which feeds actually make good radio, since a one-line changelog firehose and a long-form engineering blog need very different handling.
+
 That's the whole setup. From now on it runs by itself; `state.json` is created and committed by the bot — never edit it by hand.
 
 ## Configuration reference
