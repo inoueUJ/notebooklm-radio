@@ -46,6 +46,24 @@ jobs:
       - name: Test
         run: pytest -q
 
+      - name: Notify on test/lint failure
+        # Without this, a failing gate skips the batch silently: no radio and no
+        # message at all (25 runs went missing this way in 2026-08).
+        if: failure()
+        env:
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$NOTIFY_WEBHOOK_URL" ]; then exit 0; fi
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          url = os.environ['NOTIFY_WEBHOOK_URL']
+          text = "🚨 テスト/lint が失敗したので、今回の batch は実行されていないよ（ラジオは生成されない）\n" + os.environ['RUN_URL']
+          key = 'content' if 'discord.com' in url else 'text'
+          req = urllib.request.Request(url, data=json.dumps({key: text}).encode(), headers={'Content-Type': 'application/json'})
+          urllib.request.urlopen(req, timeout=15)
+          EOF
+
   run-batch:
     needs: test
     runs-on: ubuntu-latest
@@ -104,12 +122,18 @@ jobs:
           command -v notebooklm
 
       - name: Run batch script
+        id: batch
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
           NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
         run: python radio_batch.py
 
       - name: Commit and push state.json if updated
+        # Also runs when the batch failed: main() has already saved read-state for the
+        # topics that succeeded before exiting non-zero. Skipping the push here re-sent
+        # the same watch notifications and re-processed the successful topic on every
+        # failed run. Not on cancel, and not when the batch never ran.
+        if: ${{ !cancelled() && (steps.batch.outcome == 'success' || steps.batch.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
