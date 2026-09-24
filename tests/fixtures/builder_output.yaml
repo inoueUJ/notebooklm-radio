@@ -1,0 +1,86 @@
+# notebooklm-radio config.yaml — built with https://inoueuj.github.io/tech-feed-catalog/ on 2026-09-24
+# Replace your whole config.yaml with this file, then check it: python radio_batch.py --check-config
+feeds:
+  - name: Anthropic News
+    type: sitemap
+    url: https://www.anthropic.com/sitemap.xml
+    prefix: https://www.anthropic.com/news/
+    topic: AI
+  - name: Cloudflare Blog
+    url: https://blog.cloudflare.com/rss/
+    topic: Infra
+  - name: Vercel Changelog
+    url: https://vercel.com/atom
+    topic: Infra
+    mode: latest  # newest N per run; the rest is marked read (firehose feed)
+  - name: Hacker News Front Page
+    url: https://hnrss.org/frontpage
+    topic: "ニュース"
+    mode: latest  # newest N per run; the rest is marked read (firehose feed)
+  - name: OpenAI News
+    url: https://openai.com/news/rss.xml
+    topic: AI
+    # article pages are bot-protected; submit the feed summary instead
+    source_mode: text
+  - name: Cloudflare Changelog
+    url: https://developers.cloudflare.com/changelog/rss.xml
+    topic: Changelog
+  - name: Vercel Blog
+    url: https://vercel.com/blog/feed
+    topic: Infra
+  - name: "Zenn: rust"
+    url: https://zenn.dev/topics/rust/feed
+    topic: Dev
+
+# One notebook (and one Audio Overview per run) per topic. Overrides settings.audio per topic.
+topics:
+  AI:
+    audio:
+      format: deep-dive
+      length: long
+      prompt: >-
+        洞察力のある素人が鋭い質問を投げ、専門家が深く答える対談形式で。
+        各ニュースの表面的な紹介ではなく、「なぜ今このタイミングで出たのか」と、Next.js, Cloudflare Workers を使う開発者の日常に何が変わるかを深掘りすること。件数を網羅するより、重要な話題を選んで掘り下げてよい。
+  Infra:
+    audio:
+      format: deep-dive
+      length: long
+      prompt: >-
+        洞察力のある素人が鋭い質問を投げ、専門家が深く答える対談形式で。
+        各ニュースの表面的な紹介ではなく、「なぜ今このタイミングで出たのか」と、Next.js, Cloudflare Workers を使う開発者の日常に何が変わるかを深掘りすること。件数を網羅するより、重要な話題を選んで掘り下げてよい。
+  "ニュース":
+    audio:
+      format: deep-dive
+      length: long
+      prompt: >-
+        洞察力のある素人が鋭い質問を投げ、専門家が深く答える対談形式で。
+        各ニュースの表面的な紹介ではなく、「なぜ今このタイミングで出たのか」と、Next.js, Cloudflare Workers を使う開発者の日常に何が変わるかを深掘りすること。件数を網羅するより、重要な話題を選んで掘り下げてよい。
+  Changelog:
+    audio:
+      format: brief
+      length: short
+      prompt: >-
+        変更点だけを簡潔に。
+  Dev:
+    audio:
+      format: deep-dive
+      length: long
+      prompt: >-
+        洞察力のある素人が鋭い質問を投げ、専門家が深く答える対談形式で。
+        各ニュースの表面的な紹介ではなく、「なぜ今このタイミングで出たのか」と、Next.js, Cloudflare Workers を使う開発者の日常に何が変わるかを深掘りすること。件数を網羅するより、重要な話題を選んで掘り下げてよい。
+
+settings:
+  notebook_title_format: "Tech Radio {topic} {date}"
+  language: ja
+  timezone: Asia/Tokyo
+  default_topic: AI
+  limits:
+    per_feed: 3
+    total: 15
+  audio:
+    scope: run  # each run's episode covers only the articles added in that run
+  cleanup:
+    enabled: true
+    retention_days: 7
+    dry_run: true  # flip to false once the would-delete list in your notifications looks right
+  stale_feed_days: 30

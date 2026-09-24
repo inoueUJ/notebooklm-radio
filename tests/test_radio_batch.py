@@ -1351,3 +1351,26 @@ def test_cleanup_matches_topics_section_names(notebooklm_box):
     ]
     rb.cleanup_old_notebooks(config, 'https://hooks.slack.com/x', now=NOW)
     assert notebooklm_box['deleted'] == ['a']
+
+
+# --- 設定ビルダー（tech-feed-catalog）の出力と、この検査の互換性を固定する -----------------
+
+
+def test_builder_output_fixture_is_valid():
+    """https://inoueuj.github.io/tech-feed-catalog/ が生成した config.yaml をそのまま受け付ける。
+
+    ビルダーの出力形式を変えたら tests/fixtures/builder_output.yaml も更新すること。
+    トピック名が日本語（引用符付きキー）、mode: latest、source_mode: text、topics: の上書きを含む。
+    """
+    import os
+
+    path = os.path.join(os.path.dirname(__file__), 'fixtures', 'builder_output.yaml')
+    with open(path, encoding='utf-8') as f:
+        config = rb.yaml.safe_load(f)
+    assert rb.validate_config(config) == []
+    assert rb.audio_settings_for(config, 'Changelog')['format'] == 'brief'
+    assert rb.audio_settings_for(config, 'ニュース')['language'] == 'ja'
+    assert [f['name'] for f in config['feeds'] if f.get('mode') == 'latest'] == [
+        'Vercel Changelog',
+        'Hacker News Front Page',
+    ]
