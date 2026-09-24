@@ -33,35 +33,27 @@ Details that took real incidents to get right (1,226 falsely-new articles, a 16-
 
 ## Quick start
 
-You need: a GitHub account, a Google account with NotebookLM access, a Slack or Discord webhook, and a machine with a browser for the one-time login.
+You need: a GitHub account, a Google account with NotebookLM access, a Slack or Discord webhook (step 4 tells you where to get one), and a machine with a browser for the one-time login. Locally you need [uv](https://docs.astral.sh/uv/getting-started/installation/) and the [GitHub CLI](https://cli.github.com/) (`gh auth login` once); the wizard in step 4 checks for both and tells you what's missing.
 
-**1. Create your copy** — click **Use this template → Create a new repository**. Choose **Private** (the bot commits your reading history into `state.json`).
+**1. Build your config first** — open **[the config builder](https://inoueuj.github.io/tech-feed-catalog/)**. Tick feeds from the catalog or add your own (a Zenn topic, a Qiita tag, any feed URL — checked live), group them into notebooks, pick a conversation style per notebook, set your language, timezone and run times, then **Download** `config.yaml` and copy the two cron lines from the *cron* tab. The page also warns you about the things that bite later: your NotebookLM plan's daily Audio Overview quota vs. notebooks × runs, feeds that publish more than you can process, two feeds carrying the same articles, bot-blocked hosts. Doing this *before* creating the repo means the very first episode is already yours.
 
-**2. Log in to NotebookLM locally and capture credentials:**
+**2. Create your copy** — click **Use this template → Create a new repository**. Choose **Private** (the bot commits your reading history into `state.json`). Clone it.
 
-```bash
-uv tool install "notebooklm-py[browser]"
-notebooklm -p ci login        # a browser window opens — log in to Google normally
-```
+**3. Put your config in** — replace `config.yaml` with the downloaded file, and the two `- cron:` lines in `.github/workflows/rss-radio.yml` with the ones from the *cron* tab. (Hand-editing works too; `python radio_batch.py --check-config` validates the file without running anything.)
 
-This saves your session to `~/.notebooklm/profiles/ci/storage_state.json`. The `-p ci` profile is deliberate: keeping the CI session separate from your everyday one extends the credential's life from ~3 days to ~3.5 weeks (measured — see [docs/OPERATIONS.md](docs/OPERATIONS.md)).
-
-**3. Set the two secrets** (repo → Settings → Secrets and variables → Actions, or via CLI):
+**4. Run the setup wizard** in the clone:
 
 ```bash
-gh secret set NOTEBOOKLM_AUTH_JSON < ~/.notebooklm/profiles/ci/storage_state.json
-gh secret set NOTIFY_WEBHOOK_URL   # paste your Slack incoming-webhook or Discord webhook URL
+python scripts/setup.py
 ```
 
-Slack and Discord are auto-detected from the URL.
+It installs the pinned `notebooklm` CLI with uv, opens a browser for the Google login into a dedicated `ci` profile (kept separate from your everyday one, which is what extends the credential's life from ~3 days to ~3.5 weeks — see [docs/OPERATIONS.md](docs/OPERATIONS.md)), stores the session as the `NOTEBOOKLM_AUTH_JSON` secret, asks for your webhook URL and stores it as `NOTIFY_WEBHOOK_URL`, and triggers the first run. Nothing is typed into a shell redirect, so it works in PowerShell too, and the credential's contents never appear on screen. `python scripts/setup.py doctor` shows the same checks without changing anything.
 
-**4. Run it once** — repo → Actions tab → enable workflows if prompted → *RSS Radio Automation* → **Run workflow**. Within a few minutes you should get a webhook ping, and a notebook named like `Tech Radio AI 2026-08-31` appears in [NotebookLM](https://notebooklm.google.com) with audio generating. The first run initializes read-state: it processes only the latest article per feed and marks the backlog as read (no flood).
+Where the webhook comes from: **Slack** — [api.slack.com/apps](https://api.slack.com/apps) → Create New App → Incoming Webhooks → Activate → Add New Webhook to Workspace → pick a channel → copy the URL. **Discord** — channel settings → Integrations → Webhooks → New Webhook → Copy Webhook URL. Both are auto-detected from the URL.
 
-**5. Make it yours** — edit `config.yaml`: swap in your feeds, set `language`, `timezone`, and the audio style prompt. The cron schedule in `.github/workflows/rss-radio.yml` assumes JST mornings; shift it to your timezone.
+**5. Listen** — within a few minutes you get a webhook message listing today's articles with a link to each notebook, and the audio renders inside [NotebookLM](https://notebooklm.google.com) over the next ~20 minutes. The first run initializes read-state: it processes only the latest article per feed and marks the backlog as read (no flood). After a week, look at the 🧹 would-delete list in your notifications and, if it's right, set `cleanup.dry_run: false`.
 
-Don't know which feeds to add? **[tech-feed-catalog](https://inoueuj.github.io/tech-feed-catalog/)** is a companion catalog of continuously validated developer feeds — filter by topic, tick the ones you want, and copy a `config.yaml` block straight into this file. It also marks which feeds actually make good radio, since a one-line changelog firehose and a long-form engineering blog need very different handling.
-
-That's the whole setup. From now on it runs by itself; `state.json` is created and committed by the bot — never edit it by hand.
+That's the whole setup. From now on it runs by itself; `state.json` is created and committed by the bot — never edit it by hand. Every ~3.5 weeks the Google session expires and an error message tells you so; the fix is `python scripts/setup.py renew` (about two minutes).
 
 ## Configuration reference
 

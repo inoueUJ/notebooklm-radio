@@ -18,14 +18,22 @@ Why: the two profiles are separate Google sessions (verified: `SID` / `__Secure-
 
 ## Renewal runbook (~2 minutes)
 
-When auth expires (or the canary/error notification says so):
+When auth expires (or the error notification says so):
+
+```bash
+python scripts/setup.py renew
+```
+
+That runs `notebooklm -p ci login`, streams `~/.notebooklm/profiles/ci/storage_state.json` into the `NOTEBOOKLM_AUTH_JSON` secret (through stdin, so it works in PowerShell too), records the date in the `NOTEBOOKLM_AUTH_UPDATED` repository variable, and offers to re-run the workflow. The manual equivalent:
 
 ```bash
 notebooklm -p ci login
 gh secret set NOTEBOOKLM_AUTH_JSON < ~/.notebooklm/profiles/ci/storage_state.json
 ```
 
-Then re-run the workflow (Actions → Run workflow) or wait for the next cron.
+Then re-run the workflow (Actions → Run workflow) or wait for the next cron. `python scripts/setup.py doctor` shows the credential's age at any time.
+
+**On `--master-token`.** notebooklm-py 0.8.0 added `notebooklm login --master-token`, a long-lived account-level token meant for cron recovery. Its own source describes it as full-account, durable and "infostealer-grade", to be used with a dedicated throwaway account only. That is a legitimate way to escape the 3.5-week renewal — *if* the radio runs under a throwaway Google account you would not mind losing, which also means a free-tier NotebookLM quota (3 Audio Overviews/day). This project does not use it by default and does not recommend it for your main account.
 
 ## How expiry actually presents (an upstream quirk worth knowing)
 

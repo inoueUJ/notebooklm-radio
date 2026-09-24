@@ -33,35 +33,27 @@ flowchart LR
 
 ## クイックスタート
 
-必要なもの: GitHub アカウント、NotebookLM が使える Google アカウント、Slack か Discord の webhook、初回ログイン用のブラウザが動く PC。
+必要なもの: GitHub アカウント、NotebookLM が使える Google アカウント、Slack か Discord の webhook(取り方は手順 4 に書いてあります)、初回ログイン用のブラウザが動く PC。ローカルには [uv](https://docs.astral.sh/uv/getting-started/installation/) と [GitHub CLI](https://cli.github.com/)(一度 `gh auth login`)が必要です。手順 4 のウィザードが両方を確認して、足りないものを教えてくれます。
 
-**1. 自分のコピーを作る** — **Use this template → Create a new repository** をクリック。**Private** を選んでください(bot があなたの購読履歴を `state.json` にコミットするため)。
+**1. まず設定を作る** — **[設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/)** を開きます。カタログからフィードにチェックを入れる(Zenn のトピック、Qiita のタグ、任意のフィード URL も追加でき、その場で疎通確認されます)→ ノートブック(=番組)にまとめる → ノートブックごとに会話の形式を選ぶ → 言語・タイムゾーン・実行時刻を決める → **Download** で `config.yaml` を保存し、*cron* タブの 2 行をコピー。ビルダーは後で困ることも先に教えてくれます: NotebookLM プランの 1 日の音声生成上限とノートブック数 × 実行回数の関係、処理しきれない流量のフィード、同じ記事を配信する 2 つのフィード、ボット対策で取れないホスト。リポジトリを作る前にこれをやっておくと、最初の 1 本から自分の番組になります。
 
-**2. ローカルで NotebookLM にログインして認証情報を取る:**
+**2. 自分のコピーを作る** — **Use this template → Create a new repository** をクリック。**Private** を選んでください(bot があなたの購読履歴を `state.json` にコミットするため)。clone します。
 
-```bash
-uv tool install "notebooklm-py[browser]"
-notebooklm -p ci login        # ブラウザが開くので、普通に Google にログイン
-```
+**3. 設定を入れる** — `config.yaml` をダウンロードしたファイルで置き換え、`.github/workflows/rss-radio.yml` の `- cron:` 2 行を *cron* タブのものに差し替えます。(手で書いても構いません。`python radio_batch.py --check-config` で、何も実行せずに検査できます。)
 
-セッションが `~/.notebooklm/profiles/ci/storage_state.json` に保存されます。`-p ci` は意図的です: CI 用セッションを普段使いと分けると、認証情報の寿命が約 3 日 → 約 3.5 週間に延びます(実測。[docs/OPERATIONS.md](docs/OPERATIONS.md) 参照)。
-
-**3. シークレットを 2 つ登録する**(リポジトリ → Settings → Secrets and variables → Actions、または CLI):
+**4. セットアップウィザードを走らせる**(clone の中で):
 
 ```bash
-gh secret set NOTEBOOKLM_AUTH_JSON < ~/.notebooklm/profiles/ci/storage_state.json
-gh secret set NOTIFY_WEBHOOK_URL   # Slack incoming webhook か Discord webhook の URL
+python scripts/setup.py
 ```
 
-Slack / Discord は URL から自動判別されます。
+uv でピン留めされた版の `notebooklm` CLI を入れ、ブラウザを開いて CI 専用の `ci` プロファイルに Google ログインし(普段使いと分けることで認証情報の寿命が約 3 日 → 約 3.5 週間に延びます。[docs/OPERATIONS.md](docs/OPERATIONS.md) 参照)、そのセッションを `NOTEBOOKLM_AUTH_JSON` シークレットに登録し、webhook URL を聞いて `NOTIFY_WEBHOOK_URL` に登録し、最初の実行を起動します。シェルのリダイレクトを使わないので PowerShell でも動き、認証情報の中身は画面に出ません。`python scripts/setup.py doctor` は同じ確認だけをして何も変えません。
 
-**4. 一度手で回す** — リポジトリ → Actions タブ →(表示されたら)ワークフローを有効化 → *RSS Radio Automation* → **Run workflow**。数分で webhook に通知が届き、[NotebookLM](https://notebooklm.google.com) に `Tech Radio AI 2026-08-31` のようなノートブックができて音声生成が始まれば成功です。初回は既読状態の初期化として、各フィード最新 1 件だけを処理し、過去分は既読になります(洪水は起きません)。
+webhook の取り方: **Slack** — [api.slack.com/apps](https://api.slack.com/apps) → Create New App → Incoming Webhooks → Activate → Add New Webhook to Workspace → チャンネルを選ぶ → URL をコピー。**Discord** — チャンネル設定 → 連携サービス → ウェブフック → 新しいウェブフック → URL をコピー。どちらも URL から自動判別されます。
 
-**5. 自分仕様にする** — `config.yaml` を編集してフィードを差し替え、`language`・`timezone`・音声のスタイルプロンプトを設定。`.github/workflows/rss-radio.yml` の cron は JST の朝を想定しているので、自分のタイムゾーンに合わせてください。
+**5. 聴く** — 数分で、今日の記事一覧と各ノートブックへのリンク付きの通知が届き、[NotebookLM](https://notebooklm.google.com) の中で 20 分ほどかけて音声ができます。初回は既読状態の初期化として、各フィード最新 1 件だけを処理し、過去分は既読になります(洪水は起きません)。1 週間ほど経ったら通知の 🧹 削除予定リストを見て、正しければ `cleanup.dry_run: false` にしてください。
 
-どのフィードを入れればいいか分からない場合は、姉妹プロジェクトの **[tech-feed-catalog](https://inoueuj.github.io/tech-feed-catalog/)** を使ってください。継続的に生存確認されている開発者向けフィードのカタログで、カテゴリで絞ってチェックを入れると `config.yaml` に貼れるブロックがそのまま生成されます。「ラジオ向きかどうか」も載っています — 1行の changelog の洪水と長文の技術ブログでは、扱いがまったく違うからです。
-
-セットアップはこれで全部です。以後は勝手に回ります。`state.json` は bot が作ってコミットします — 手で編集しないでください。
+セットアップはこれで全部です。以後は勝手に回ります。`state.json` は bot が作ってコミットします — 手で編集しないでください。約 3.5 週間ごとに Google のセッションが切れ、エラー通知が届きます。直し方は `python scripts/setup.py renew`(2 分ほど)です。
 
 ## 設定リファレンス
 
