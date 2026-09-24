@@ -79,6 +79,206 @@ def apply_settings_overrides(config):
     USER_AGENT = settings.get('user_agent', USER_AGENT)
 
 
+class ConfigError(ValueError):
+    """config.yaml の内容が不正。実行前に止めて、何が悪いかを通知に載せる。"""
+
+
+# config.yaml で受け付けるキー。config.schema.json（ビルダー用の型定義）と同じ規則。
+TOP_KEYS = {'feeds', 'topics', 'watch', 'settings'}
+FEED_KEYS = {'name', 'url', 'type', 'prefix', 'topic', 'source_mode', 'mode'}
+TOPIC_KEYS = {'audio'}
+WATCH_KEYS = {'name', 'url', 'prefix', 'keywords'}
+SETTINGS_KEYS = {
+    'notebook_title_format',
+    'language',
+    'timezone',
+    'default_topic',
+    'limits',
+    'user_agent',
+    'audio',
+    'cleanup',
+    'stale_feed_days',
+}
+LIMITS_KEYS = {'per_feed', 'total'}
+AUDIO_KEYS = {'length', 'format', 'prompt', 'scope', 'language'}
+CLEANUP_KEYS = {'enabled', 'retention_days', 'dry_run', 'legacy_title_formats'}
+FEED_TYPES = {'rss', 'sitemap'}
+SOURCE_MODES = {'url', TEXT_SOURCE_MODE}
+FEED_MODES = {'backlog', 'latest'}
+AUDIO_LENGTHS = {'short', 'default', 'long'}
+AUDIO_FORMATS = {'deep-dive', 'brief', 'critique', 'debate'}
+AUDIO_SCOPES = {'run', 'notebook'}
+
+
+def _validate_audio(audio, where, errors):
+    if audio is None:
+        return
+    if not isinstance(audio, dict):
+        errors.append(f"{where}: マッピング（length / format / prompt / scope / language）である必要がある")
+        return
+    for key in sorted(set(audio) - AUDIO_KEYS):
+        errors.append(f"{where}: 不明なキー `{key}`")
+    for key, allowed in (('length', AUDIO_LENGTHS), ('format', AUDIO_FORMATS), ('scope', AUDIO_SCOPES)):
+        if key in audio and audio[key] not in allowed:
+            errors.append(f"{where}.{key}: {sorted(allowed)} のいずれか（実際: {audio[key]!r}）")
+    for key in ('prompt', 'language'):
+        if key in audio and not isinstance(audio[key], str):
+            errors.append(f"{where}.{key}: 文字列である必要がある")
+
+
+def _positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def validate_config(config):
+    """config.yaml を実行前に検査する。致命的な問題は ConfigError にまとめて投げ、注意点は文字列の一覧で返す。
+
+    typo が黙って既定値に落ちるのが一番怖い（`feed:` と書くと全件消えて「新着なし」に見える、
+    `topics:` をフィード内に書くと既定トピックに流れる）ので、未知のキーはエラーにする。
+    ネットワークにも NotebookLM にも触れない。`--check-config` と CI の検査ステップから呼ばれる。
+    """
+    errors, warnings = [], []
+    if not isinstance(config, dict):
+        raise ConfigError('config.yaml のトップレベルはマッピング（feeds: / settings: ...）である必要がある')
+
+    def unknown(keys, allowed, where):
+        for key in sorted(set(keys) - allowed):
+            errors.append(f"{where}: 不明なキー `{key}`")
+
+    unknown(config.keys(), TOP_KEYS, 'トップレベル')
+    settings = config.get('settings') or {}
+    if not isinstance(settings, dict):
+        errors.append('`settings:` はマッピングである必要がある')
+        settings = {}
+    default_topic = settings.get('default_topic', DEFAULT_TOPIC)
+
+    feeds = config.get('feeds')
+    if not isinstance(feeds, list) or not feeds:
+        errors.append('`feeds:` にフィードを 1 つ以上書く必要がある')
+        feeds = []
+    feed_topics = set()
+    seen_keys = {}
+    for i, feed in enumerate(feeds, 1):
+        where = f"feeds[{i}]"
+        if not isinstance(feed, dict):
+            errors.append(f"{where}: マッピング（name: / url: ...）である必要がある")
+            continue
+        if isinstance(feed.get('name'), str) and feed['name']:
+            where += f" ({feed['name']})"
+        unknown(feed.keys(), FEED_KEYS, where)
+        for required in ('name', 'url'):
+            if not isinstance(feed.get(required), str) or not feed[required]:
+                errors.append(f"{where}: `{required}` が必要")
+        ftype = feed.get('type', 'rss')
+        if ftype not in FEED_TYPES:
+            errors.append(f"{where}: `type` は {sorted(FEED_TYPES)} のいずれか（実際: {ftype!r}）")
+        if ftype == 'sitemap' and not isinstance(feed.get('prefix'), str):
+            errors.append(f"{where}: `type: sitemap` には `prefix`（記事 URL の先頭）が必要")
+        if ftype != 'sitemap' and 'prefix' in feed:
+            warnings.append(f"{where}: `prefix` は sitemap 型でしか使われない")
+        if 'topic' in feed and not isinstance(feed['topic'], str):
+            errors.append(f"{where}: `topic` は文字列 1 つ（1 フィード = 1 トピック。複数指定は未対応）")
+        if feed.get('source_mode', 'url') not in SOURCE_MODES:
+            errors.append(f"{where}: `source_mode` は {sorted(SOURCE_MODES)} のいずれか")
+        mode = feed.get('mode', 'backlog')
+        if mode not in FEED_MODES:
+            errors.append(f"{where}: `mode` は {sorted(FEED_MODES)} のいずれか（実際: {mode!r}）")
+        elif mode == 'latest' and ftype == 'sitemap':
+            warnings.append(f"{where}: `mode: latest` は sitemap 型では無視される（seen-set は毎回全件を見る）")
+        if isinstance(feed.get('url'), str):
+            key = f"sitemap:{feed['url']}:{feed.get('prefix')}" if ftype == 'sitemap' else feed['url']
+            if key in seen_keys:
+                errors.append(
+                    f"{where}: `url` が {seen_keys[key]} と重複（同じフィードを 2 回購読すると既読状態を奪い合う）"
+                )
+            seen_keys.setdefault(key, where)
+        topic = feed.get('topic', default_topic)
+        if isinstance(topic, str):
+            feed_topics.add(topic)
+
+    topics = config.get('topics')
+    if topics is None:
+        topics = {}
+    if not isinstance(topics, dict):
+        errors.append('`topics:` はトピック名をキーにしたマッピングである必要がある')
+        topics = {}
+    for name, topic_cfg in topics.items():
+        where = f"topics.{name}"
+        if topic_cfg is None:
+            continue
+        if not isinstance(topic_cfg, dict):
+            errors.append(f"{where}: マッピング（audio: ...）である必要がある")
+            continue
+        unknown(topic_cfg.keys(), TOPIC_KEYS, where)
+        _validate_audio(topic_cfg.get('audio'), f"{where}.audio", errors)
+        if name not in feed_topics:
+            warnings.append(f"{where}: このトピックを使うフィードが無い（feeds[].topic と綴りを確認）")
+
+    for i, watch_cfg in enumerate(config.get('watch') or [], 1):
+        where = f"watch[{i}]"
+        if not isinstance(watch_cfg, dict):
+            errors.append(f"{where}: マッピングである必要がある")
+            continue
+        unknown(watch_cfg.keys(), WATCH_KEYS, where)
+        for required in ('name', 'url', 'prefix'):
+            if not isinstance(watch_cfg.get(required), str) or not watch_cfg[required]:
+                errors.append(f"{where}: `{required}` が必要")
+        keywords = watch_cfg.get('keywords', [])
+        if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
+            errors.append(f"{where}: `keywords` は文字列のリスト")
+
+    unknown(settings.keys(), SETTINGS_KEYS, 'settings')
+    title_format = settings.get('notebook_title_format', 'Tech Radio {date}')
+    if not isinstance(title_format, str) or '{date}' not in title_format:
+        errors.append('settings.notebook_title_format には {date} が必要（日ごとのノートブックと自動削除の判定に使う）')
+    else:
+        for placeholder in re.findall(r'\{([^{}]*)\}', title_format):
+            if placeholder not in ('date', 'topic'):
+                errors.append(
+                    f"settings.notebook_title_format: 使えるのは {{date}} と {{topic}} だけ（{{{placeholder}}} は不明）"
+                )
+        if '{topic}' not in title_format and len(feed_topics) > 1:
+            warnings.append(
+                'settings.notebook_title_format に {topic} が無いので、全トピックが同じノートブックに入り、'
+                'トピックの数だけ音声が生成される'
+            )
+    if 'timezone' in settings:
+        try:
+            ZoneInfo(settings['timezone'])
+        except Exception:
+            errors.append(f"settings.timezone: 不明なタイムゾーン {settings['timezone']!r}（例: Asia/Tokyo）")
+    if 'language' in settings and not isinstance(settings['language'], str):
+        errors.append('settings.language: 文字列である必要がある（例: ja）')
+    limits = settings.get('limits') or {}
+    if not isinstance(limits, dict):
+        errors.append('settings.limits: マッピング（per_feed / total）である必要がある')
+    else:
+        unknown(limits.keys(), LIMITS_KEYS, 'settings.limits')
+        for key in LIMITS_KEYS & set(limits):
+            if not _positive_int(limits[key]):
+                errors.append(f"settings.limits.{key}: 1 以上の整数")
+    _validate_audio(settings.get('audio'), 'settings.audio', errors)
+    cleanup = settings.get('cleanup') or {}
+    if not isinstance(cleanup, dict):
+        errors.append('settings.cleanup: マッピングである必要がある')
+    else:
+        unknown(cleanup.keys(), CLEANUP_KEYS, 'settings.cleanup')
+        if 'retention_days' in cleanup and not _positive_int(cleanup['retention_days']):
+            errors.append('settings.cleanup.retention_days: 1 以上の整数')
+        for key in ('enabled', 'dry_run'):
+            if key in cleanup and not isinstance(cleanup[key], bool):
+                errors.append(f"settings.cleanup.{key}: true / false")
+        legacy = cleanup.get('legacy_title_formats') or []
+        if not isinstance(legacy, list) or not all(isinstance(t, str) and '{date}' in t for t in legacy):
+            errors.append('settings.cleanup.legacy_title_formats: {date} を含む文字列のリスト')
+    if 'stale_feed_days' in settings and not _positive_int(settings['stale_feed_days']):
+        errors.append('settings.stale_feed_days: 1 以上の整数')
+
+    if errors:
+        raise ConfigError('config.yaml に問題がある:\n' + '\n'.join(f"・{e}" for e in errors))
+    return warnings
+
+
 def load_state():
     if os.path.exists(STATE_PATH):
         try:
@@ -289,7 +489,10 @@ def source_add_args(article, notebook_id):
 
 
 def add_sources_and_wait(notebook_id, articles):
-    """ソースを追加して読み込みを待つ。(音声を生成してよいか, 取り込めなかった [(url, title)]) を返す。
+    """ソースを追加して読み込みを待つ。(使えるソース ID の一覧, 取り込めなかった [(url, title)]) を返す。
+
+    一覧が空なら音声を生成しない。ID を返すのは `generate audio -s` で「この回に入れた記事だけ」から
+    音声を作るため（夕方の回が朝の記事を再放送しない）。
 
     1件の失敗でバッチ全体を止めない。1件も追加できなかった場合のみ例外を投げる。
     add が成功しても、サイトのボット対策ページを掴まされていることがある
@@ -318,7 +521,7 @@ def add_sources_and_wait(notebook_id, articles):
         print(f"Note: {len(failed_urls)} source(s) failed, continuing with {len(source_ids)} source(s).")
 
     # 読み込み待ちも個別に失敗を許容する（add と同じ方針）
-    ready = 0
+    ready_ids = []
     for sid in source_ids.values():
         print(f"Waiting for source to be ready: {sid}")
         try:
@@ -327,20 +530,21 @@ def add_sources_and_wait(notebook_id, articles):
                 check=True,
                 timeout=SOURCE_WAIT_TIMEOUT,
             )
-            ready += 1
+            ready_ids.append(sid)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print(f"Warning: Source {sid} did not become ready: {type(e).__name__}")
 
-    if ready == 0:
+    if not ready_ids:
         raise RuntimeError('No source became ready; skipping audio generation.')
 
     # 判定はURL投入分だけ。テキスト投入分はフェッチャーを通っていないので構造上
     # ボット対策ページになり得ず、こちらが付けたタイトルを誤検知するだけになる。
     blocked = remove_junk_sources(notebook_id, fetched_ids)
-    usable = len(source_ids) - len(blocked)
-    print(f"{ready}/{len(source_ids)} source(s) ready, {len(blocked)} junk removed, {usable} usable.")
-    # 全部ボット対策ページだった場合は音声を生成しない（古いソースだけで空回りさせない）
-    return usable > 0, blocked
+    junk_ids = {fetched_ids[url] for url, _title in blocked if url in fetched_ids}
+    usable_ids = [sid for sid in ready_ids if sid not in junk_ids]
+    print(f"{len(ready_ids)}/{len(source_ids)} source(s) ready, {len(blocked)} junk removed, {len(usable_ids)} usable.")
+    # 全部ボット対策ページだった場合は空を返し、音声を生成しない（古いソースだけで空回りさせない）
+    return usable_ids, blocked
 
 
 def remove_junk_sources(notebook_id, source_ids):
@@ -374,14 +578,33 @@ def remove_junk_sources(notebook_id, source_ids):
     return blocked
 
 
-def generate_audio(notebook_id, language='ja', prompt=None, length=None):
-    print(f"Triggering audio generation (language: {language})...")
+def audio_settings_for(config, topic):
+    """音声設定を topics.<topic>.audio → settings.audio → 既定 の順で解決する。
+
+    language だけは settings.language が全体の既定（topics.<topic>.audio.language で上書き可）。
+    トピックごとに format（deep-dive / brief / critique / debate）やプロンプトを変えるための入口。
+    """
+    settings = config.get('settings') or {}
+    merged = {'language': settings.get('language', 'ja')}
+    merged.update(settings.get('audio') or {})
+    topic_cfg = (config.get('topics') or {}).get(topic) or {}
+    merged.update(topic_cfg.get('audio') or {})
+    return merged
+
+
+def generate_audio(notebook_id, language='ja', prompt=None, length=None, fmt=None, source_ids=None):
+    print(f"Triggering audio generation (language: {language}, format: {fmt or 'default'})...")
     # --no-wait のため、これは「生成の開始」であって「完了」ではない。
     # --json 付き(run_notebooklm_json)で呼ぶのは、失敗時に CLI の封筒(code/message)を通知に
     # 載せるため。日次の生成上限に当たると rate_limited で失敗するが、exit code だけでは分からない。
     args = ['generate', 'audio', '--no-wait', '--notebook', notebook_id, '--language', language]
+    if fmt:
+        args += ['--format', fmt]
     if length:
         args += ['--length', length]
+    # -s を渡すとその回に入れた記事だけから音声を作る。渡さなければノートブック全体（scope: notebook）
+    for sid in source_ids or ():
+        args += ['-s', sid]
     if prompt:
         args.append(prompt)
     result = run_notebooklm_json(args)
@@ -556,7 +779,9 @@ def _notebook_title_patterns(config):
     settings = config.get('settings', {})
     templates = [settings.get('notebook_title_format', 'Tech Radio {date}')]
     templates += (settings.get('cleanup') or {}).get('legacy_title_formats') or []
+    # feeds[].topic に加えて topics: セクションの名前も候補にする（フィードを外した後も掃除できるように）
     topics = {f.get('topic', DEFAULT_TOPIC) for f in config.get('feeds', [])} | {DEFAULT_TOPIC}
+    topics |= set((config.get('topics') or {}).keys())
     topic_re = '(?:' + '|'.join(re.escape(t) for t in sorted(topics)) + ')'
 
     patterns = []
@@ -975,11 +1200,22 @@ def check_rss_feeds(config, state):
             }
 
         unread.sort(key=lambda e: e['ts'] or EPOCH)
+        latest_mode = feed_cfg.get('mode') == 'latest' and not is_sitemap
+        result['latest'] = latest_mode
 
         if first_run:
             # 初回は最新1件だけ処理し、残りは既読にする（過去記事の洪水を防ぐ）
             picked = unread[-1:]
             print(f"[{name}] First run: marking all {len(entries)} entries as read, processing the latest one.")
+        elif latest_mode:
+            # アグリゲータ向け（mode: latest）: 古い順に消化せず「最新 N 件」だけ拾い、残りの未読は
+            # 意図的に既読にする。「処理していない記事を既読にしない」ルールのフィード単位の例外で、
+            # 流量の多いフィードが永遠に古い記事を流し続けるのを避けるための選択（docs/DESIGN.md）。
+            picked = unread[-MAX_ARTICLES_PER_FEED:]
+            if len(unread) > len(picked):
+                print(
+                    f"[{name}] latest mode: processing the newest {len(picked)} of {len(unread)} unread; skipping the rest."
+                )
         else:
             # 古い順に処理する。上限を超えた分は「既読にせず」次回に持ち越す
             picked = unread[:MAX_ARTICLES_PER_FEED]
@@ -987,7 +1223,10 @@ def check_rss_feeds(config, state):
                 print(f"[{name}] {len(unread)} unread; processing {len(picked)}, carrying over the rest.")
 
         for article in picked:
-            article['_first_run'] = first_run  # 全体上限(select_articles)で落とさないための印
+            article['_first_run'] = first_run
+            # 全体上限(select_articles)で落とさないための印。初回分と mode: latest 分は常に通す
+            # （latest は最新記事なので、古い順の全体上限に掛けると毎回真っ先に落ちてしまう）
+            article['_priority'] = first_run or latest_mode
             print(f"[{name}] New article: {article['title']}")
 
         candidates.extend(picked)
@@ -1044,14 +1283,18 @@ def advance_state(state, feed_results, processed, now=None):
         entries = result['entries']
         prev_watermark = result['watermark']
 
-        if result['first_run']:
-            # 初回のみ、フィード全体を既読にする
+        picked = [e for e in entries if is_processed(e)]
+        # 初回はフィード全体を既読にする。mode: latest も、拾った回は残りの未読を意図的に既読にする
+        # （拾えなかった回 = トピック失敗時は何も進めず、次回また最新を拾い直す）
+        mark_all = result['first_run'] or (result.get('latest') and picked)
+        if mark_all:
             dated = [e['ts'] for e in entries if e['ts']]
+            if prev_watermark:
+                dated.append(prev_watermark)  # フィードが縮んでも透かしは戻さない
             new_watermark = max(dated) if dated else EPOCH
-            # 公開時刻を持たないエントリも、初回はすべて既読にする
+            # 公開時刻を持たないエントリもすべて既読にする
             dateless = [e['id'] for e in entries if e['ts'] is None]
         else:
-            picked = [e for e in entries if is_processed(e)]
             if not picked:
                 continue  # このフィードからは何も処理していない → 変更なし
             # 日付なしの記事しか処理しなかった場合も、既読(recent_ids)の記録は必要。
@@ -1065,7 +1308,7 @@ def advance_state(state, feed_results, processed, now=None):
         # 記録するのは「処理した」ものだけ(初回は全既読なので全件)。同時刻の未処理分まで載せると、
         # 持ち越したはずの記事が既読扱いで消える。is_unread が同時刻を未読に倒しているのは、
         # このリストが「処理済みの同時刻 ID」を正確に持つことが前提。
-        tie_source = entries if result['first_run'] else picked
+        tie_source = entries if mark_all else picked
         ties = [e['id'] for e in tie_source if e['ts'] == new_watermark]
 
         merged = list(dict.fromkeys([*result['recent_ids'], *ties, *dateless]))
@@ -1112,27 +1355,59 @@ def dedupe_by_link(candidates):
     return unique
 
 
-def select_articles(candidates):
-    """全体上限を適用する。初回実行分は各フィード1件なので常に通す。"""
-    candidates = dedupe_by_link(candidates)
-    first_run_articles = [a for a in candidates if a.get('_first_run')]
-    rest = sorted([a for a in candidates if not a.get('_first_run')], key=lambda e: e['ts'] or EPOCH)
+def _is_priority(article):
+    return bool(article.get('_priority') or article.get('_first_run'))
 
-    remaining = max(MAX_ARTICLES_TOTAL - len(first_run_articles), 0)
-    selected = first_run_articles + rest[:remaining]
+
+def select_articles(candidates):
+    """全体上限を適用する。初回実行分（各フィード1件）と mode: latest 分（各フィード N 件）は常に通す。"""
+    candidates = dedupe_by_link(candidates)
+    priority = [a for a in candidates if _is_priority(a)]
+    rest = sorted([a for a in candidates if not _is_priority(a)], key=lambda e: e['ts'] or EPOCH)
+
+    remaining = max(MAX_ARTICLES_TOTAL - len(priority), 0)
+    selected = priority + rest[:remaining]
     if len(selected) < len(candidates):
         print(f"Capping articles from {len(candidates)} to {len(selected)}.")
     return selected
 
 
+def check_config_command():
+    """`--check-config`: config.yaml を検査して終了する。
+
+    ネットワークにも NotebookLM にも state.json にも触れない（副作用ゼロ）。CI の test ジョブと
+    ローカルの確認用。壊れた config は batch が走る前にここで止まる。
+    """
+    try:
+        config = load_config()
+        warnings = validate_config(config)
+    except (ConfigError, yaml.YAMLError, OSError) as e:
+        print(f"config.yaml NG\n{e}", file=sys.stderr)
+        return 1
+    for warning in warnings:
+        print(f"warning: {warning}")
+    feeds = config.get('feeds') or []
+    default_topic = (config.get('settings') or {}).get('default_topic', DEFAULT_TOPIC)
+    topics = sorted({f.get('topic', default_topic) for f in feeds})
+    print(f"config.yaml OK: {len(feeds)} feed(s), topics: {', '.join(topics)}")
+    return 0
+
+
 def main():
-    config = load_config()
-    apply_settings_overrides(config)
-    state = load_state()
+    if '--check-config' in sys.argv[1:]:
+        sys.exit(check_config_command())
+
     webhook_url = os.environ.get('NOTIFY_WEBHOOK_URL')
     notebook_title = None
 
     try:
+        # 設定の読み込みと検査も try の中で行い、壊れた config も（ログだけでなく）通知に出す
+        config = load_config()
+        for warning in validate_config(config):
+            print(f"Config warning: {warning}")
+        apply_settings_overrides(config)
+        state = load_state()
+
         candidates, feed_results, warnings = check_rss_feeds(config, state)
 
         # ページ更新監視（Slack通知のみ、ラジオ化しない）。失敗しても本体は止めない
@@ -1161,9 +1436,6 @@ def main():
         for art in new_articles:
             by_topic.setdefault(art.get('topic', DEFAULT_TOPIC), []).append(art)
 
-        settings = config.get('settings', {})
-        audio_cfg = settings.get('audio') or {}
-
         processed = []  # 実際にノートブックへ入った（または取り込み不能と確定した）記事
         blocked = []  # ボット対策ページで中身が取れなかった [(url, title)]
         failures = []  # (notebook_title, exception) ノートブック作成・ソース投入の失敗。記事は持ち越す
@@ -1178,16 +1450,20 @@ def main():
                 notebooks[topic] = (notebook_title, notebook_id)
 
                 # 2. ソースの追加 & 待機（ボット対策ページを掴んだソースはここで除去される）
-                audio_ok, topic_blocked = add_sources_and_wait(notebook_id, articles)
+                usable_ids, topic_blocked = add_sources_and_wait(notebook_id, articles)
 
-                # 3. ラジオの生成トリガー
-                if audio_ok:
+                # 3. ラジオの生成トリガー（音声設定は topics.<topic>.audio → settings.audio の順）
+                if usable_ids:
+                    audio = audio_settings_for(config, topic)
                     try:
                         generate_audio(
                             notebook_id,
-                            language=settings.get('language', 'ja'),
-                            prompt=audio_cfg.get('prompt'),
-                            length=audio_cfg.get('length'),
+                            language=audio['language'],
+                            prompt=audio.get('prompt'),
+                            length=audio.get('length'),
+                            fmt=audio.get('format'),
+                            # scope: run（既定）= この回に入れた記事だけで 1 本。夕方の回が朝の記事を再放送しない
+                            source_ids=usable_ids if audio.get('scope', 'run') == 'run' else None,
                         )
                     except Exception as e:
                         # ソースは既にノートブックに入っている。記事を未読のまま残すと次回また同じ URL を

@@ -1,6 +1,8 @@
+import copy
 import datetime
 import json
 import subprocess
+import sys
 
 import pytest
 
@@ -763,7 +765,7 @@ def test_junk_sources_are_removed_and_reported(monkeypatch):
 
     audio_ok, blocked = rb.add_sources_and_wait('nb1', [article(u) for u in box['ids']])
 
-    assert audio_ok is True  # 使えるソースが残っているので音声は生成する
+    assert audio_ok == ['src-ok']  # 使えるソースが残っているので音声は生成する（-s に渡す ID）
     assert blocked == [('https://openai.example/b', 'Just a moment...')]
     # -y が無いと CI(TTY なし)で確認プロンプトが Abort になり、削除が成立しない
     assert ['source', 'delete', 'src-junk', '-y', '--notebook', 'nb1'] in box['calls']
@@ -792,7 +794,7 @@ def test_all_junk_sources_skip_audio(monkeypatch):
 
     audio_ok, blocked = rb.add_sources_and_wait('nb1', [article(u) for u in box['ids']])
 
-    assert audio_ok is False  # 中身のあるソースがゼロなら音声を生成しない
+    assert audio_ok == []  # 中身のあるソースがゼロなら音声を生成しない
     assert len(blocked) == 1
 
 
@@ -825,7 +827,7 @@ def test_text_source_add_does_not_send_the_url(monkeypatch):
     assert '--type' in add_call and add_call[add_call.index('--type') + 1] == 'text'
     assert add_call[2] != TEXT_ARTICLE['link']  # 位置引数は本文であってURLではない
     assert add_call[2].startswith('# ')
-    assert audio_ok is True and blocked == []
+    assert audio_ok and blocked == []
 
 
 def test_text_source_body_states_it_is_only_a_summary():
@@ -858,7 +860,7 @@ def test_text_source_is_exempt_from_junk_detection(monkeypatch):
     audio_ok, blocked = rb.add_sources_and_wait('nb1', [{**TEXT_ARTICLE, 'title': 'Just a moment in AI history'}])
 
     assert blocked == []
-    assert audio_ok is True
+    assert audio_ok
     assert not [c for c in box['calls'] if c[:2] == ['source', 'delete']]
 
 
@@ -877,7 +879,7 @@ def test_text_and_url_sources_mix_in_one_notebook(monkeypatch):
     adds = [c for c in box['calls'] if c[:2] == ['source', 'add']]
     assert adds[0][2] == 'https://good.example/a' and '--type' not in adds[0]
     assert '--type' in adds[1]
-    assert audio_ok is True and blocked == []
+    assert audio_ok and blocked == []
 
 
 def test_title_starting_with_dash_is_not_parsed_as_an_option():
@@ -952,13 +954,16 @@ def test_audio_failure_marks_articles_read_and_reports(monkeypatch):
     通知に載ること。
     """
     art = {'id': 'a1', 'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F', 'topic': 'AI', 'ts': None}
-    monkeypatch.setattr(rb, 'load_config', lambda: {'feeds': [], 'settings': {}})
+    monkeypatch.setattr(
+        rb, 'load_config', lambda: {'feeds': [{'name': 'F', 'url': 'https://f.example/feed'}], 'settings': {}}
+    )
     monkeypatch.setattr(rb, 'load_state', lambda: {})
     monkeypatch.setattr(rb, 'save_state', lambda state: None)
     monkeypatch.setattr(rb, 'check_rss_feeds', lambda config, state: ([art], [], []))
     monkeypatch.setattr(rb, 'check_watch_pages', lambda config, state, url: [])
     monkeypatch.setattr(rb, 'get_or_create_notebook', lambda title: 'nb1')
-    monkeypatch.setattr(rb, 'add_sources_and_wait', lambda nb, arts: (True, []))
+    monkeypatch.setattr(rb, 'add_sources_and_wait', lambda nb, arts: (['src-1'], []))
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py'])
     monkeypatch.setattr(rb, 'run_maintenance', lambda *a: None)
 
     def fail(*a, **kw):
@@ -1050,3 +1055,299 @@ def test_timeout_does_not_masquerade_as_a_cli_error():
 
     assert msg.startswith('TimeoutExpired:')
     assert 'Exit code' not in msg
+
+
+# --- 設定の検査（validate_config / --check-config） ----------------------------------
+
+VALID_CONFIG = {
+    'feeds': [
+        {'name': 'A', 'url': 'https://a.example/feed', 'topic': 'AI'},
+        {
+            'name': 'S',
+            'url': 'https://s.example/sitemap.xml',
+            'type': 'sitemap',
+            'prefix': 'https://s.example/news/',
+            'topic': 'Infra',
+        },
+    ],
+    'topics': {'AI': {'audio': {'format': 'deep-dive', 'length': 'long'}}},
+    'settings': {
+        'notebook_title_format': 'Tech Radio {topic} {date}',
+        'language': 'ja',
+        'timezone': 'Asia/Tokyo',
+        'limits': {'per_feed': 3, 'total': 15},
+        'audio': {'length': 'long', 'prompt': 'x'},
+        'cleanup': {'enabled': True, 'retention_days': 7, 'dry_run': True},
+    },
+}
+
+
+def _invalid(mutate):
+    config = copy.deepcopy(VALID_CONFIG)
+    mutate(config)
+    with pytest.raises(rb.ConfigError) as exc:
+        rb.validate_config(config)
+    return str(exc.value)
+
+
+def test_shipped_config_is_valid():
+    """リポジトリの config.yaml 自体が検査を通る（警告もなし）。"""
+    assert rb.validate_config(rb.load_config()) == []
+
+
+def test_valid_config_passes():
+    assert rb.validate_config(copy.deepcopy(VALID_CONFIG)) == []
+
+
+def test_validate_rejects_top_level_typo():
+    """`feed:` と書くと全件消えて「新着なし」に見える。黙って通さない。"""
+    msg = _invalid(lambda c: c.update(feed=c.pop('feeds')))
+    assert '不明なキー `feed`' in msg and '`feeds:`' in msg
+
+
+def test_validate_rejects_feed_key_typo():
+    msg = _invalid(lambda c: c['feeds'][0].update(topics='AI'))
+    assert 'feeds[1] (A)' in msg and '`topics`' in msg
+
+
+def test_validate_requires_prefix_for_sitemap():
+    msg = _invalid(lambda c: c['feeds'][1].pop('prefix'))
+    assert 'prefix' in msg
+
+
+def test_validate_rejects_duplicate_feed_url():
+    msg = _invalid(lambda c: c['feeds'].append({'name': 'A2', 'url': 'https://a.example/feed'}))
+    assert '重複' in msg
+
+
+def test_validate_rejects_topic_list():
+    msg = _invalid(lambda c: c['feeds'][0].update(topic=['AI', 'Infra']))
+    assert '`topic` は文字列 1 つ' in msg
+
+
+def test_validate_requires_date_placeholder():
+    msg = _invalid(lambda c: c['settings'].update(notebook_title_format='Tech Radio {topic}'))
+    assert '{date}' in msg
+
+
+def test_validate_rejects_unknown_placeholder():
+    msg = _invalid(lambda c: c['settings'].update(notebook_title_format='Radio {foo} {date}'))
+    assert '{foo}' in msg
+
+
+def test_validate_rejects_bad_enums_and_timezone():
+    def mutate(c):
+        c['settings']['audio']['format'] = 'podcast'
+        c['settings']['timezone'] = 'Mars/Olympus'
+
+    msg = _invalid(mutate)
+    assert 'settings.audio.format' in msg and 'settings.timezone' in msg
+
+
+def test_validate_collects_all_errors_at_once():
+    def mutate(c):
+        c['feeds'][0].pop('url')
+        c['settings']['limits']['per_feed'] = 0
+
+    msg = _invalid(mutate)
+    assert '`url` が必要' in msg and 'limits.per_feed' in msg
+
+
+def test_validate_warns_without_failing():
+    config = copy.deepcopy(VALID_CONFIG)
+    config['topics']['Unused'] = {'audio': {'format': 'brief'}}
+    config['feeds'][1]['mode'] = 'latest'  # sitemap では無視される
+    warnings = rb.validate_config(config)
+    assert any('Unused' in w for w in warnings) and any('latest' in w for w in warnings)
+
+
+def test_check_config_flag_has_no_side_effects(monkeypatch, capsys):
+    monkeypatch.setattr(rb, 'load_config', lambda: copy.deepcopy(VALID_CONFIG))
+    monkeypatch.setattr(rb, 'load_state', lambda: pytest.fail('state must not be read'))
+    monkeypatch.setattr(rb, 'check_rss_feeds', lambda *a: pytest.fail('feeds must not be fetched'))
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py', '--check-config'])
+    with pytest.raises(SystemExit) as exc:
+        rb.main()
+    assert exc.value.code == 0
+    assert 'config.yaml OK' in capsys.readouterr().out
+
+
+def test_broken_config_is_reported_not_swallowed(monkeypatch):
+    """壊れた config は Actions ログだけでなく通知にも出る（以前は try の外で落ちて沈黙していた）。"""
+    monkeypatch.setattr(rb, 'load_config', lambda: {'feed': []})
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    monkeypatch.setenv('NOTIFY_WEBHOOK_URL', 'https://hooks.slack.com/x')
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py'])
+    with pytest.raises(SystemExit) as exc:
+        rb.main()
+    assert exc.value.code == 1
+    assert 'ConfigError' in json.dumps(posted, ensure_ascii=False)
+
+
+# --- トピック別の音声設定と差分エピソード ----------------------------------------------
+
+
+def test_audio_settings_topic_overrides_global():
+    config = {
+        'settings': {'language': 'ja', 'audio': {'length': 'long', 'prompt': '全体'}},
+        'topics': {'Infra': {'audio': {'format': 'brief', 'length': 'default'}}},
+    }
+    assert rb.audio_settings_for(config, 'Infra') == {
+        'language': 'ja',
+        'length': 'default',
+        'prompt': '全体',
+        'format': 'brief',
+    }
+    # topics に無いトピックは全体設定のまま
+    assert rb.audio_settings_for(config, 'AI') == {'language': 'ja', 'length': 'long', 'prompt': '全体'}
+
+
+def test_generate_audio_passes_format_and_source_scope(monkeypatch):
+    calls = []
+    monkeypatch.setattr(rb, 'run_notebooklm_json', lambda args, retries=1: calls.append(args) or {'status': 'pending'})
+    rb.generate_audio('nb1', language='en', prompt='p', length='short', fmt='debate', source_ids=['s1', 's2'])
+    args = calls[0]
+    assert args[args.index('--format') + 1] == 'debate'
+    assert [args[i + 1] for i, a in enumerate(args) if a == '-s'] == ['s1', 's2']
+    assert args[-1] == 'p'
+
+
+def test_add_sources_excludes_unready_and_junk_from_usable_ids(monkeypatch):
+    """-s に渡す ID は「読み込みが完了し、ジャンクでもない」ものだけ。"""
+    box = {
+        'calls': [],
+        'ids': {
+            'https://good.example/a': 'src-ok',
+            'https://slow.example/c': 'src-slow',
+            'https://openai.example/b': 'src-junk',
+        },
+        'sources': [
+            {'id': 'src-ok', 'title': '良い記事'},
+            {'id': 'src-slow', 'title': '遅い記事'},
+            {'id': 'src-junk', 'title': 'Just a moment...'},
+        ],
+    }
+    monkeypatch.setattr(rb, 'run_notebooklm_json', make_source_cli(box))
+
+    def wait(cmd, **kw):
+        if cmd[3] == 'src-slow':  # ['notebooklm', 'source', 'wait', <id>, ...]
+            raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(rb.subprocess, 'run', wait)
+    usable, blocked = rb.add_sources_and_wait('nb1', [article(u) for u in box['ids']])
+    assert usable == ['src-ok']
+    assert blocked == [('https://openai.example/b', 'Just a moment...')]
+
+
+def test_main_scopes_audio_to_this_runs_sources(monkeypatch):
+    """夕方の回は夕方に入れた記事だけで音声を作る（scope: run が既定）。"""
+    art = {'id': 'a1', 'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F', 'topic': 'Infra', 'ts': None}
+    config = {
+        'feeds': [{'name': 'F', 'url': 'https://f.example/feed'}],
+        'settings': {'language': 'ja'},
+        'topics': {'Infra': {'audio': {'format': 'brief'}}},
+    }
+    monkeypatch.setattr(rb, 'load_config', lambda: config)
+    monkeypatch.setattr(rb, 'load_state', lambda: {})
+    monkeypatch.setattr(rb, 'save_state', lambda state: None)
+    monkeypatch.setattr(rb, 'check_rss_feeds', lambda config, state: ([art], [], []))
+    monkeypatch.setattr(rb, 'check_watch_pages', lambda config, state, url: [])
+    monkeypatch.setattr(rb, 'get_or_create_notebook', lambda title: 'nb1')
+    monkeypatch.setattr(rb, 'add_sources_and_wait', lambda nb, arts: (['src-new'], []))
+    monkeypatch.setattr(rb, 'run_maintenance', lambda *a: None)
+    monkeypatch.setattr(rb, 'advance_state', lambda *a, **k: None)
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: None)
+    calls = []
+    monkeypatch.setattr(rb, 'generate_audio', lambda *a, **kw: calls.append(kw))
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py'])
+
+    rb.main()
+    assert calls == [{'language': 'ja', 'prompt': None, 'length': None, 'fmt': 'brief', 'source_ids': ['src-new']}]
+
+
+# --- mode: latest（アグリゲータ向け、フィード単位のオプトイン） -----------------------------
+
+
+def test_latest_mode_takes_newest_and_marks_rest_read(feed_box):
+    """最新 N 件だけ拾い、残りは意図的に既読にする。「処理していない記事を既読にしない」の明示的な例外。"""
+    config = {'feeds': [{'name': 'Agg', 'url': FEED_URL, 'mode': 'latest'}]}
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box, config)  # 初回
+
+    feed_box['feed'] = make_feed(30)  # 20 件の新着
+    titles, _ = run_once(state, feed_box, config)
+    assert titles == ['記事28', '記事29', '記事30']  # 最新 3 件（古い順に並ぶ）
+    assert run_once(state, feed_box, config)[0] == []  # 残り 17 件は既読扱い
+
+
+def test_latest_mode_keeps_state_when_nothing_was_processed(feed_box):
+    """トピックが失敗して何も処理できなかった回は既読を進めず、次回また最新を拾い直す。"""
+    config = {'feeds': [{'name': 'Agg', 'url': FEED_URL, 'mode': 'latest'}]}
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box, config)
+    before = dict(state[FEED_URL])
+
+    feed_box['feed'] = make_feed(30)
+    _candidates, results, _ = rb.check_rss_feeds(config, state)
+    rb.advance_state(state, results, [])
+    assert state[FEED_URL] == before
+    assert run_once(state, feed_box, config)[0] == ['記事28', '記事29', '記事30']
+
+
+def test_latest_mode_articles_survive_total_cap(feed_box, monkeypatch):
+    """latest 分は最新記事なので、古い順に切る全体上限で真っ先に落ちないよう常に通す。"""
+    monkeypatch.setattr(rb, 'MAX_ARTICLES_TOTAL', 4)
+    config = {
+        'feeds': [
+            {'name': 'Old', 'url': 'https://old.example/feed'},
+            {'name': 'Agg', 'url': FEED_URL, 'mode': 'latest'},
+        ]
+    }
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box, config)
+
+    feed_box['feed'] = make_feed(30)
+    titles, _ = run_once(state, feed_box, config)
+    assert len(titles) == 4 and {'記事28', '記事29', '記事30'} <= set(titles)
+
+
+def test_latest_mode_is_ignored_for_sitemaps(monkeypatch):
+    """sitemap は seen-set で毎回全件を見るので latest の出番がない（検査が警告するだけ）。"""
+    warnings = rb.validate_config(
+        {
+            'feeds': [
+                {
+                    'name': 'S',
+                    'url': 'https://s.example/sitemap.xml',
+                    'type': 'sitemap',
+                    'prefix': 'https://s.example/',
+                    'mode': 'latest',
+                }
+            ]
+        }
+    )
+    assert warnings and 'latest' in warnings[0]
+
+
+# --- cleanup は topics: セクションの名前も候補にする ------------------------------------------
+
+
+def test_cleanup_matches_topics_section_names(notebooklm_box):
+    config = {
+        'feeds': [{'name': 'F', 'url': 'https://f.example/feed'}],
+        'topics': {'Security': None},
+        'settings': {
+            'notebook_title_format': 'Tech Radio {topic} {date}',
+            'cleanup': {'enabled': True, 'retention_days': 7, 'dry_run': False},
+        },
+    }
+    notebooklm_box['notebooks'] = [
+        {'id': 'a', 'title': 'Tech Radio Security 2026-07-01'},  # topics: にだけある名前 → 削除
+        {'id': 'b', 'title': 'Tech Radio Podcast 2026-07-01'},  # どこにもない名前 → 触らない
+    ]
+    rb.cleanup_old_notebooks(config, 'https://hooks.slack.com/x', now=NOW)
+    assert notebooklm_box['deleted'] == ['a']

@@ -48,10 +48,21 @@ A seen-set is correct *and* bounded here because a sitemap returns its full URL 
 - **A same-timestamp entry not in `recent_ids` is unread.** `recent_ids` must therefore contain exactly the processed entries at the watermark time — never the unprocessed ones.
 - **An article whose sources were added but whose audio could not be started is still marked read.** The sources are already in the notebook; leaving the article unread would only re-add the same URLs next run. The failure is reported separately, with the CLI's error code (e.g. `rate_limited` when the daily Audio Overview quota is hit).
 - First run per feed processes only the newest article and marks the rest read — no backlog flood on day one.
+- **`mode: latest` is the one deliberate exception** to "never mark unread articles read", and it is opt-in per feed. An aggregator that publishes hundreds of items a month cannot be drained oldest-first at three per run without airing week-old items forever; for such feeds the user chooses "the newest N each run, the rest is read". A run that processes nothing from such a feed (its topic failed) advances nothing, so the next run picks the newest again. Sitemaps ignore it — a seen-set looks at the full URL set every run, so there is no backlog to skip.
 
 ## Topic split
 
 Each feed maps to a `topic`, and each topic gets its own daily notebook and its own audio generation. Mixing AI news and infrastructure changelogs in one conversation produced incoherent radio. Topics fail independently: one topic's error doesn't stop the other's episode, read-state advances only for articles whose topic succeeded, and the run exits non-zero at the end if anything failed.
+
+**Per-topic audio.** `topics.<name>.audio` overrides `settings.audio` for one topic (`format`, `length`, `prompt`, `language`), resolved by `audio_settings_for`. A changelog topic can be a short *brief* while the AI topic stays a long *deep-dive*. Cleanup recognizes topic names from this section as well as from `feeds[].topic`, so a topic whose feeds were removed still gets its old notebooks deleted.
+
+**Episodes cover the run, not the day.** Two runs a day share one notebook per topic, but the second Audio Overview is generated with `-s` limited to the sources added in *that* run (`settings.audio.scope: run`, the default). Before this, the evening episode re-discussed every morning article. `scope: notebook` restores the old whole-notebook behavior.
+
+**Quota is the real limit on splitting.** NotebookLM caps Audio Overviews per day (3 on the free tier, 6 on Plus, 20 on Pro). Every topic × every run is one generation, so two topics twice a day already exceed the free tier; the fourth trigger fails with `rate_limited`, the articles stay in the notebook and are marked read, and the failure is reported. Choose the number of topics and runs with that arithmetic in mind.
+
+## Configuration is validated, not trusted
+
+`validate_config` runs before anything else, and `python radio_batch.py --check-config` runs it alone (CI does the same before every batch). Unknown keys are **errors**, not warnings: a `feed:` typo used to yield zero feeds and a cheerful "nothing new today", and a `topics:` inside a feed silently routed it to the default topic. The same rules are published as `config.schema.json` so that a config builder can only produce what the runtime accepts. This is not a dry-run mode for the batch — it reads one file and touches nothing else.
 
 ## Cleanup: the full-match guarantee
 
@@ -74,7 +85,7 @@ Documented so they aren't "fixed" casually:
 - **No backend abstraction over the notebooklm CLI (yet).** All CLI calls sit behind ~8 conceptual operations (list/create/delete notebook, add/wait/list/delete source, generate audio), so an adapter seam exists on paper. It stays unbuilt until a concrete second backend (e.g. an official API) gives it a reason to exist. Abstractions built for one implementation are speculation.
 - **Not a pip library.** notebooklm-py owns the client-library niche; this is an application template. The value is the pipeline and its operational hardening, not an importable API.
 - **No notification plugin system.** Slack and Discord are auto-detected from the webhook URL; that covers the realistic cases at near-zero complexity.
-- **No dry-run mode for the batch itself.** The script's side effects are the product. Verification is `pytest -q` (53 tests, no network — the CLI boundary and feed fetching are monkeypatched); real execution happens only via `gh workflow run`.
+- **No dry-run mode for the batch itself.** The script's side effects are the product. Verification is `pytest -q` (no network — the CLI boundary and feed fetching are monkeypatched); real execution happens only via `gh workflow run`. `--check-config` is not a dry run: it validates `config.yaml` and exits without touching feeds, NotebookLM or state.
 - **No User-Agent spoofing.** See above.
 
 ## Known weaknesses (and where they lead)

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/inoueUJ/notebooklm-radio/config.schema.json",
+  "title": "notebooklm-radio config.yaml",
+  "description": "Shape of config.yaml. The runtime enforces the same rules in validate_config() (python radio_batch.py --check-config); the config builder generates files that satisfy this schema. Unknown keys are errors, because a typo that silently falls back to a default is the worst failure mode.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["feeds"],
+  "properties": {
+    "feeds": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Feeds to turn into radio. Each feed belongs to exactly one topic; the same feed URL may not appear twice (sitemaps may, with different prefixes).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "url"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "description": "Display name used in notifications." },
+          "url": { "type": "string", "format": "uri", "description": "RSS/Atom feed URL, or a sitemap.xml URL when type is sitemap." },
+          "type": { "type": "string", "enum": ["rss", "sitemap"], "default": "rss" },
+          "prefix": { "type": "string", "description": "Required for sitemap feeds: only URLs starting with this prefix are treated as articles. Also part of the read-state key, so two feeds may share one sitemap with different prefixes." },
+          "topic": { "type": "string", "description": "Which daily notebook the articles go to. One notebook and one Audio Overview per topic per run. Defaults to settings.default_topic." },
+          "source_mode": { "type": "string", "enum": ["url", "text"], "default": "url", "description": "text: submit the RSS title + summary as a text source instead of the URL, for hosts that block NotebookLM's fetcher with a bot challenge. The radio then only knows the summary, and says so." },
+          "mode": { "type": "string", "enum": ["backlog", "latest"], "default": "backlog", "description": "backlog: process unread articles oldest-first, carrying overflow to the next run (never drops anything). latest: take only the newest N (settings.limits.per_feed) and deliberately mark the rest read — for aggregators and other firehoses where 'today's top' matters more than completeness. Ignored for sitemaps." }
+        },
+        "if": { "properties": { "type": { "const": "sitemap" } }, "required": ["type"] },
+        "then": { "required": ["prefix"] }
+      }
+    },
+    "topics": {
+      "type": "object",
+      "description": "Per-topic overrides, keyed by topic name (the same strings used in feeds[].topic). Topic names listed here are also recognized by cleanup even after their feeds are removed.",
+      "additionalProperties": {
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "properties": {
+          "audio": { "$ref": "#/$defs/audio" }
+        }
+      }
+    },
+    "watch": {
+      "type": "array",
+      "description": "Notification-only page monitoring (never becomes radio). Watches a sitemap for new URLs and changed <lastmod> under a prefix.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "url", "prefix"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "url": { "type": "string", "format": "uri", "description": "sitemap.xml URL." },
+          "prefix": { "type": "string" },
+          "keywords": { "type": "array", "items": { "type": "string" }, "description": "Case-insensitive substrings matched against the page URL. Empty means every page under the prefix." }
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "notebook_title_format": { "type": "string", "default": "Tech Radio {date}", "pattern": "\\{date\\}", "description": "Must contain {date}; may contain {topic}. Cleanup deletes only notebooks whose title fully matches this format, so it must never match a hand-made notebook." },
+        "language": { "type": "string", "default": "ja", "description": "Audio Overview language (any language NotebookLM supports)." },
+        "timezone": { "type": "string", "default": "Asia/Tokyo", "description": "IANA timezone for notebook dates and monthly checks. Runners are UTC." },
+        "default_topic": { "type": "string", "default": "AI" },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "per_feed": { "type": "integer", "minimum": 1, "default": 3, "description": "Articles per feed per run." },
+            "total": { "type": "integer", "minimum": 1, "default": 15, "description": "Articles per run across all feeds. Sources are waited on serially; raising this eats into the 30-minute job timeout." }
+          }
+        },
+        "user_agent": { "type": "string", "description": "User-Agent sent when fetching feeds. Point it at your own repository." },
+        "audio": { "$ref": "#/$defs/audio", "description": "Global Audio Overview settings; topics.<name>.audio overrides them per topic." },
+        "cleanup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "retention_days": { "type": "integer", "minimum": 1, "default": 7 },
+            "dry_run": { "type": "boolean", "default": true, "description": "Post the would-delete list instead of deleting. Keep true until the list has been observed to be correct." },
+            "legacy_title_formats": { "type": "array", "items": { "type": "string", "pattern": "\\{date\\}" }, "description": "Retired title formats whose notebooks should still be cleaned up." }
+          }
+        },
+        "stale_feed_days": { "type": "integer", "minimum": 1, "default": 30, "description": "On the 1st of each month, report feeds with no new articles for this many days." }
+      }
+    }
+  },
+  "$defs": {
+    "audio": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "format": { "type": "string", "enum": ["deep-dive", "brief", "critique", "debate"], "description": "Conversation style. NotebookLM's default is deep-dive." },
+        "length": { "type": "string", "enum": ["short", "default", "long"] },
+        "prompt": { "type": "string", "description": "Style/focus instructions passed to the Audio Overview customization. Write it in the same language as `language`." },
+        "language": { "type": "string", "description": "Per-topic language override (only meaningful under topics.<name>.audio)." },
+        "scope": { "type": "string", "enum": ["run", "notebook"], "default": "run", "description": "run: generate from the sources added in this run only, so the second run of a day covers only its own articles. notebook: generate from every source in the notebook." }
+      }
+    }
+  }
+}

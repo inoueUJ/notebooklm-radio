@@ -46,6 +46,12 @@ jobs:
       - name: Test
         run: pytest -q
 
+      - name: Validate config.yaml
+        # Read-only: no network, no NotebookLM, no state.json. A typo in config.yaml
+        # stops here with a readable message instead of silently falling back to
+        # defaults inside the batch.
+        run: python radio_batch.py --check-config
+
       - name: Notify on test/lint failure
         # Without this, a failing gate skips the batch silently: no radio and no
         # message at all (25 runs went missing this way in 2026-08).

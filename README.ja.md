@@ -72,12 +72,16 @@ Slack / Discord は URL から自動判別されます。
 | `feeds[].topic` | トピックごとに 1 日 1 ノートブック + 1 ラジオ。無関係な話題を混ぜると番組が散らかるので分ける。 |
 | `feeds[].type: sitemap` | RSS の無いサイト向け。`sitemap.xml` を読み、`prefix` 配下の URL を記事として扱う。 |
 | `feeds[].source_mode: text` | ボット対策で NotebookLM のフェッチャーが弾かれるホスト向け。URL の代わりに RSS の要約をテキスト投入し、「要約のみ」と明示する。 |
+| `feeds[].mode: latest` | アグリゲータなど流量の多いフィード向け。毎回最新 N 件だけ拾い、残りは意図的に既読にする(既定の backlog は古い順に消化して何も捨てない)。 |
+| `topics.<name>.audio` | トピック別の音声設定の上書き — `format`(deep-dive / brief / critique / debate)、`length`、`prompt`、`language`。 |
 | `settings.notebook_title_format` | 自動削除はこの形式に**完全一致**するタイトルだけが対象。手動で作ったノートブックには構造的に触れない。 |
 | `settings.timezone` | ノートブックの日付と月次判定の基準。runner は UTC なので必ず自分のものを。 |
 | `settings.limits` | 1 回に処理する記事数。超過分は捨てずに次回へ持ち越し。 |
-| `settings.audio` | 音声概要に渡す長さとスタイル指示。 |
+| `settings.audio` | 全体の音声設定: `format`、`length`、`prompt`、`scope`(既定 `run`: その回に入れた記事だけで 1 本。`notebook`: その日のノートブック全体)。 |
 | `settings.cleanup` | 古い日次ノートブックの自動削除。`dry_run: true` で出荷 — 削除予定リストが正しいのを確認してから false に。 |
 | `watch:` | 通知だけのページ監視(ラジオ化はしない)。 |
+
+編集した設定は何も実行せずに検査できます: `python radio_batch.py --check-config`。`config.yaml` を読むだけで、ネットワークにも NotebookLM にも触れません。CI も毎回 batch の前に同じ検査を走らせるので、typo(`feeds:` を `feed:`、フィード内に `topics:`)は既定値に黙って落ちず、読めるメッセージで止まります。設定の全体像は [`config.schema.json`](config.schema.json) にあります。
 
 ## 運用
 

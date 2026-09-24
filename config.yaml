@@ -9,6 +9,12 @@
 #                topics in one radio makes the conversation incoherent, so split them.
 #   type:        "sitemap" for sites that publish no RSS feed (see the commented example)
 #   source_mode: "text" for hosts whose article pages block NotebookLM's fetcher
+#   mode:        "latest" for aggregators/firehoses: take only the newest N per run and
+#                deliberately mark the rest read, instead of draining a backlog oldest-first
+#                (the default, "backlog", never drops anything). See the commented example.
+#
+# Check your edits without running anything: python radio_batch.py --check-config
+# (CI runs the same check before every batch; the full shape is in config.schema.json)
 feeds:
   - name: "GitHub Changelog"
     url: "https://github.blog/changelog/feed/"
@@ -42,6 +48,31 @@ feeds:
   #   url: "https://openai.com/news/rss.xml"
   #   topic: "AI"
   #   source_mode: text
+
+  # An aggregator publishes hundreds of items a month; draining it oldest-first at
+  # `limits.per_feed` per run would air week-old items forever. `mode: latest` picks
+  # the newest N each run and marks the rest read — an explicit, per-feed exception
+  # to "never mark an article read that wasn't processed" (docs/DESIGN.md).
+  # - name: "Hacker News front page"
+  #   url: "https://hnrss.org/frontpage"
+  #   topic: "News"
+  #   mode: latest
+
+# Per-topic overrides (optional). Keys are the topic names used in feeds[].topic.
+# Everything under `audio` here overrides `settings.audio` for that topic only, so a
+# changelog-heavy topic can get a short "brief" while AI news gets a long deep-dive.
+# format: deep-dive (default) | brief | critique | debate
+# topics:
+#   AI:
+#     audio:
+#       format: deep-dive
+#       length: long
+#   Infra:
+#     audio:
+#       format: brief
+#       length: default
+#       prompt: >-
+#         変更点だけを簡潔に。何が変わり、使う側は何をすればよいかに絞ること。
 
 # Watch pages for updates (webhook notification only — never turned into radio).
 # Points at a sitemap.xml; notifies when a matching URL appears or its <lastmod>
@@ -79,8 +110,13 @@ settings:
   # operators can see who is polling them.
   # user_agent: "notebooklm-radio/1.0 (+https://github.com/YOU/YOUR-REPO)"
 
-  # Style instructions passed to NotebookLM's Audio Overview customization.
-  # Write them in the same language as `language` for best results.
+  # Audio Overview settings (topics.<name>.audio overrides these per topic).
+  #   format: deep-dive (default) | brief | critique | debate
+  #   length: short | default | long
+  #   scope:  run (default) — each run's episode covers only the articles added in that
+  #           run, so the evening episode doesn't replay the morning's articles.
+  #           notebook — generate from every source in the day's notebook.
+  #   prompt: style instructions; write them in the same language as `language`.
   audio:
     length: "long"
     prompt: >-
