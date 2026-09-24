@@ -22,7 +22,11 @@ The watermark is the publish time of the newest article ever processed. An entry
 
 **Why not a seen-ID list?** Because an ID list cannot be simultaneously *bounded* and *correct* for RSS. Vercel's feed returns 1,325 entries; any list you trim will "forget" old entries, and a forgotten entry that is still in the feed comes back as unread — forever. This is not hypothetical: the original ID-list implementation produced **1,226 falsely-new articles in one run**, followed by a permanent two-run oscillation as trimmed halves of the feed took turns looking new. A timestamp is monotonic; it doesn't care how many entries the feed returns or how many IDs you throw away.
 
-`recent_ids` exists only for the two cases a timestamp cannot decide: entries sharing the watermark's exact timestamp, and entries with no publish time at all. Date-less IDs are never allowed to fall off the end of the list — the watermark has no opinion about them, so the list is their only read-marker.
+`recent_ids` exists only for the two cases a timestamp cannot decide: entries sharing the watermark's exact timestamp, and entries with no publish time at all. Neither kind of ID is allowed to fall off the end of the list — the watermark has no opinion about them, so the list is their only read-marker.
+
+**An entry at exactly the watermark time is unread unless its ID is in `recent_ids`**, and the list records only the same-timestamp entries that were *actually processed* (plus everything on a feed's first run). The earlier version did the opposite — it treated `ts == watermark` as read and recorded *every* entry at that time — which is fine for feeds with real timestamps and silently destructive for date-only feeds (Cloudflare Changelog, Vercel, Codex), where every article of a day shares one midnight timestamp: on 2026-09-22 Cloudflare published 7 changelog entries, the per-feed limit took 3, and the other 4 were marked read without ever being processed. A late post the same day would have been lost the same way.
+
+**Two feeds that publish the same URL** (Vercel's `blog/feed` and `atom` are identical) are deduplicated by URL before selection; the article is added once, and read-state advances in both feeds because `advance_state` matches processed articles by URL as well as by ID (GUIDs differ per feed).
 
 ### Sitemap feeds use a seen-URL set
 
@@ -41,6 +45,8 @@ A seen-set is correct *and* bounded here because a sitemap returns its full URL 
 - **Never mark an article read that wasn't processed.** Articles beyond the per-run limits stay unread and are drained oldest-first on later runs.
 - **Read-state advances and saves even when there are no new articles** — a feed's first-run initialization must persist. Do not add an early return that skips it.
 - **A feed that fails to fetch must not initialize its state.** Otherwise a temporary 404 marks the entire backlog as read.
+- **A same-timestamp entry not in `recent_ids` is unread.** `recent_ids` must therefore contain exactly the processed entries at the watermark time — never the unprocessed ones.
+- **An article whose sources were added but whose audio could not be started is still marked read.** The sources are already in the notebook; leaving the article unread would only re-add the same URLs next run. The failure is reported separately, with the CLI's error code (e.g. `rate_limited` when the daily Audio Overview quota is hit).
 - First run per feed processes only the newest article and marks the rest read — no backlog flood on day one.
 
 ## Topic split

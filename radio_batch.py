@@ -154,6 +154,15 @@ AUTH_EXPIRED_HINT = (
 )
 
 
+AUDIO_FAILED_NOTE = (
+    '記事はノートブックに入ったが、音声の生成を開始できなかった。記事は既読にしてある'
+    '（再実行しても同じ URL を二重投入するだけなので）。NotebookLM アプリから手動で生成できる。'
+    'code が rate_limited なら 1 日の生成上限（無料 3 本 / Plus 6 本 / Pro 20 本）に当たっている。'
+)
+
+NOTEBOOK_URL_BASE = 'https://notebooklm.google.com/notebook/'
+
+
 def _cli_error_envelope(stdout):
     """notebooklm CLI の JSON エラー封筒から code と message だけを取り出す。
 
@@ -367,13 +376,18 @@ def remove_junk_sources(notebook_id, source_ids):
 
 def generate_audio(notebook_id, language='ja', prompt=None, length=None):
     print(f"Triggering audio generation (language: {language})...")
-    # --no-wait のため、これは「生成の開始」であって「完了」ではない
-    cmd = ['notebooklm', 'generate', 'audio', '--no-wait', '--notebook', notebook_id, '--language', language]
+    # --no-wait のため、これは「生成の開始」であって「完了」ではない。
+    # --json 付き(run_notebooklm_json)で呼ぶのは、失敗時に CLI の封筒(code/message)を通知に
+    # 載せるため。日次の生成上限に当たると rate_limited で失敗するが、exit code だけでは分からない。
+    args = ['generate', 'audio', '--no-wait', '--notebook', notebook_id, '--language', language]
     if length:
-        cmd += ['--length', length]
+        args += ['--length', length]
     if prompt:
-        cmd.append(prompt)
-    subprocess.run(cmd, check=True, timeout=NOTEBOOKLM_TIMEOUT)
+        args.append(prompt)
+    result = run_notebooklm_json(args)
+    # 標準出力を捕捉したので、ログには要点だけ残す
+    print(f"Audio generation {result.get('status', 'triggered')} (task: {result.get('task_id')})")
+    return result
 
 
 def _post_webhook(webhook_url, payload, label):
@@ -385,12 +399,20 @@ def _post_webhook(webhook_url, payload, label):
         print(f"Failed to send {label.lower()}: {redact(e)}")
 
 
-def send_notification(webhook_url, new_articles, blocked=None):
+def send_notification(webhook_url, new_articles, blocked=None, notebooks=None, no_audio=None):
+    """新着一覧を通知する。
+
+    notebooks: {topic: (title, notebook_id)}。見出しにノートブック名とリンクを載せる
+    （無いと、アプリで命名規則からノートブックを探すことになる）。
+    no_audio: 音声の生成を開始できなかった/しなかったトピックの集合。「開始した」と嘘をつかない。
+    """
     if not webhook_url:
         print("No notification Webhook URL configured. (NOTIFY_WEBHOOK_URL is empty)")
         return
 
     is_discord = "discord.com" in webhook_url
+    notebooks = notebooks or {}
+    no_audio = no_audio or set()
 
     # 参照元URLも載せる（後から出典を辿れるように）
     def fmt(art):
@@ -407,14 +429,27 @@ def send_notification(webhook_url, new_articles, blocked=None):
     sections = []
     for topic, arts in by_topic.items():
         lines = "\n".join(fmt(a) for a in arts)
-        sections.append(f"《{topic}》\n{lines}" if topic else lines)
+        header = f"《{topic}》" if topic else ''
+        if topic in notebooks:
+            title, notebook_id = notebooks[topic]
+            url = f"{NOTEBOOK_URL_BASE}{notebook_id}"
+            header += f" {title}\n  {url}" if is_discord else f" <{url}|{title}>"
+        if topic in no_audio:
+            header += "（音声は未生成）"
+        sections.append(f"{header}\n{lines}" if header else lines)
 
     parts = []
     if new_articles:
         # どのフィード（企業）から新着があったかを集計
         feed_names = list(dict.fromkeys([art['feed_name'] for art in new_articles]))  # 順序を保ったユニーク化
         sources = "、".join(feed_names)
-        parts.append(f"🎙️ {sources} が新しい記事出してたよ（{len(new_articles)}件）\nラジオの生成を開始したよ〜")
+        started = [t for t in by_topic if t not in no_audio]
+        status = (
+            "ラジオの生成を開始したよ〜"
+            if started
+            else "ラジオの生成は開始できなかったよ（理由は下の注記か別の通知を見てね）"
+        )
+        parts.append(f"🎙️ {sources} が新しい記事出してたよ（{len(new_articles)}件）\n{status}")
         parts.extend(sections)
     if blocked:
         blocked_lines = "\n".join(f"・{url}" for url, _title in blocked)
@@ -434,6 +469,14 @@ def send_no_news_notification(webhook_url):
     is_discord = "discord.com" in webhook_url
     text = "😪 今回は新着なしだったよ。ラジオはおやすみ〜"
     _post_webhook(webhook_url, {"content": text} if is_discord else {"text": text}, 'No-news notification')
+
+
+def send_maintenance_warning(webhook_url, text):
+    """メンテナンス（cleanup 等）の失敗。フィード取得の問題とは別の見出しで出す。"""
+    if not webhook_url:
+        return
+    is_discord = "discord.com" in webhook_url
+    _post_webhook(webhook_url, {"content": text} if is_discord else {"text": text}, 'Maintenance warning')
 
 
 def send_feed_warning(webhook_url, warnings):
@@ -618,7 +661,7 @@ def run_maintenance(config, state, webhook_url):
         cleanup_old_notebooks(config, webhook_url)
     except Exception as e:
         print(f"Warning: cleanup failed: {redact(e)}", file=sys.stderr)
-        send_feed_warning(webhook_url, [('ノートブック削除', f'失敗: {type(e).__name__}')])
+        send_maintenance_warning(webhook_url, f'🧹 古いラジオの削除に失敗したよ（{type(e).__name__}）。次回また試すよ')
     try:
         check_stale_feeds(config, state, webhook_url)
     except Exception as e:
@@ -842,7 +885,11 @@ def is_unread(entry_id, ts, watermark, recent_ids):
         return False
     if watermark is None or ts is None:
         return True
-    return ts > watermark
+    # 透かしと同時刻の記事は時刻では区別できない。処理済みなら recent_ids に載っているので、
+    # 載っていなければ未読。日付だけのフィード(Changelog 系)では同じ日の記事が全部同時刻に
+    # なるため、ここを `>` にすると上限で持ち越したはずの記事や、後から同日に追加された記事が
+    # 黙って消える(2026-09-22 Cloudflare Changelog: 同日 7 件のうち 4 件を喪失)。
+    return ts >= watermark
 
 
 def check_rss_feeds(config, state):
@@ -981,10 +1028,16 @@ def advance_state(state, feed_results, processed, now=None):
     """実際に処理できた記事の分だけ既読を進める。"""
     now = now or datetime.datetime.now(UTC)
     processed_ids = {a['id'] for a in processed}
+    # 同じ URL を複数のフィードが配信していた場合、ノートブックに入ったのは 1 件でも
+    # 全フィードで「処理済み」として既読を進める(dedupe_by_link と対)。GUID はフィードごとに違う
+    processed_links = {a['link'] for a in processed if a.get('link')}
+
+    def is_processed(entry):
+        return entry['id'] in processed_ids or entry.get('link') in processed_links
 
     for result in feed_results:
         if result.get('mode') == 'sitemap':
-            _advance_sitemap_state(state, result, processed_ids, now)
+            _advance_sitemap_state(state, result, processed_ids | processed_links, now)
             continue
 
         key = result['key']
@@ -998,7 +1051,7 @@ def advance_state(state, feed_results, processed, now=None):
             # 公開時刻を持たないエントリも、初回はすべて既読にする
             dateless = [e['id'] for e in entries if e['ts'] is None]
         else:
-            picked = [e for e in entries if e['id'] in processed_ids]
+            picked = [e for e in entries if is_processed(e)]
             if not picked:
                 continue  # このフィードからは何も処理していない → 変更なし
             # 日付なしの記事しか処理しなかった場合も、既読(recent_ids)の記録は必要。
@@ -1008,16 +1061,20 @@ def advance_state(state, feed_results, processed, now=None):
             # 2回目以降は、処理できたものだけを既読にする（残りは次回に持ち越す）
             dateless = [e['id'] for e in picked if e['ts'] is None]
 
-        # 透かしと同時刻のエントリは時刻で区別できないので、IDで覚えておく
-        ties = [e['id'] for e in entries if e['ts'] == new_watermark]
+        # 透かしと同時刻のエントリは時刻で区別できないので、IDで覚えておく。
+        # 記録するのは「処理した」ものだけ(初回は全既読なので全件)。同時刻の未処理分まで載せると、
+        # 持ち越したはずの記事が既読扱いで消える。is_unread が同時刻を未読に倒しているのは、
+        # このリストが「処理済みの同時刻 ID」を正確に持つことが前提。
+        tie_source = entries if result['first_run'] else picked
+        ties = [e['id'] for e in tie_source if e['ts'] == new_watermark]
 
         merged = list(dict.fromkeys([*result['recent_ids'], *ties, *dateless]))
         kept = merged[-MAX_RECENT_IDS:]
 
-        # 公開時刻を持たないIDは、透かしでは既読判定できずこのリストにしか記録がない。
-        # 上限で溢れさせると未読に戻ってしまうので、必ず残す。
-        dateless_set = set(dateless)
-        rescued = [i for i in merged if i in dateless_set and i not in kept]
+        # 公開時刻を持たないIDと、透かしと同時刻のIDは、透かしでは既読判定できずこのリストにしか
+        # 記録がない。上限で溢れさせると未読に戻ってしまうので、必ず残す。
+        must_keep = set(dateless) | {e['id'] for e in entries if e['ts'] == new_watermark}
+        rescued = [i for i in merged if i in must_keep and i not in kept]
 
         state[key] = {
             'watermark': new_watermark.isoformat(),
@@ -1035,8 +1092,29 @@ def notebook_title_for(config, topic=None, now=None):
     return template.format(date=today_str, topic=topic or DEFAULT_TOPIC)
 
 
+def dedupe_by_link(candidates):
+    """フィードをまたいで同じ URL の記事を 1 つにする(先勝ち)。
+
+    同じ記事を配信する 2 つのフィード(例: vercel.com/blog/feed と vercel.com/atom は同一内容)を
+    両方購読すると、同じ URL が 2 回ソース投入され、通知に 2 行出て、1 回あたりの上限枠も
+    2 つ消費していた。落とした側のフィードの既読は advance_state が URL で照合して進める。
+    """
+    unique, seen_links = [], set()
+    for article in candidates:
+        link = article.get('link')
+        if link and link in seen_links:
+            continue
+        if link:
+            seen_links.add(link)
+        unique.append(article)
+    if len(unique) < len(candidates):
+        print(f"Dropped {len(candidates) - len(unique)} duplicate URL(s) shared across feeds.")
+    return unique
+
+
 def select_articles(candidates):
     """全体上限を適用する。初回実行分は各フィード1件なので常に通す。"""
+    candidates = dedupe_by_link(candidates)
     first_run_articles = [a for a in candidates if a.get('_first_run')]
     rest = sorted([a for a in candidates if not a.get('_first_run')], key=lambda e: e['ts'] or EPOCH)
 
@@ -1088,26 +1166,39 @@ def main():
 
         processed = []  # 実際にノートブックへ入った（または取り込み不能と確定した）記事
         blocked = []  # ボット対策ページで中身が取れなかった [(url, title)]
-        failures = []  # (notebook_title, exception)
+        failures = []  # (notebook_title, exception) ノートブック作成・ソース投入の失敗。記事は持ち越す
+        audio_failures = []  # (notebook_title, exception) ソースは入ったが音声を開始できなかった。記事は既読
+        notebooks = {}  # topic -> (title, notebook_id)。通知にノートブックへのリンクを載せる
+        no_audio = set()  # 音声を開始しなかった/できなかったトピック。通知で「開始した」と言わない
         for topic, articles in by_topic.items():
             notebook_title = notebook_title_for(config, topic=topic)
             try:
                 # 1. ノートブックの取得・作成
                 notebook_id = get_or_create_notebook(notebook_title)
+                notebooks[topic] = (notebook_title, notebook_id)
 
                 # 2. ソースの追加 & 待機（ボット対策ページを掴んだソースはここで除去される）
                 audio_ok, topic_blocked = add_sources_and_wait(notebook_id, articles)
 
                 # 3. ラジオの生成トリガー
                 if audio_ok:
-                    generate_audio(
-                        notebook_id,
-                        language=settings.get('language', 'ja'),
-                        prompt=audio_cfg.get('prompt'),
-                        length=audio_cfg.get('length'),
-                    )
+                    try:
+                        generate_audio(
+                            notebook_id,
+                            language=settings.get('language', 'ja'),
+                            prompt=audio_cfg.get('prompt'),
+                            length=audio_cfg.get('length'),
+                        )
+                    except Exception as e:
+                        # ソースは既にノートブックに入っている。記事を未読のまま残すと次回また同じ URL を
+                        # 投入して重複するだけなので既読にし、音声だけ失敗として別枠で報告する
+                        # （日次の生成上限に当たると CLI は rate_limited で失敗する）
+                        print(f"[{topic}] Audio generation failed: {redact(e)}", file=sys.stderr)
+                        audio_failures.append((notebook_title, e))
+                        no_audio.add(topic)
                 else:
                     print(f"[{topic}] No usable sources; skipping audio generation.")
+                    no_audio.add(topic)
 
                 processed.extend(articles)
                 blocked.extend(topic_blocked)
@@ -1120,7 +1211,7 @@ def main():
         blocked_urls = {url for url, _title in blocked}
         listed = [a for a in processed if a['link'] not in blocked_urls]
         if listed or blocked:
-            send_notification(webhook_url, listed, blocked)
+            send_notification(webhook_url, listed, blocked, notebooks, no_audio)
 
         # 5. 状態保存（処理できたトピックの記事の分だけ既読を進める。失敗分は次回に持ち越す）
         advance_state(state, feed_results, processed)
@@ -1129,9 +1220,11 @@ def main():
         # 6. メンテナンス（古いラジオの削除・停滞フィード検知。失敗しても本体は成功扱い）
         run_maintenance(config, state, webhook_url)
 
-        if failures:
+        if failures or audio_failures:
             for title, e in failures:
                 send_error_notification(webhook_url, describe_failure(e), title)
+            for title, e in audio_failures:
+                send_error_notification(webhook_url, f"{AUDIO_FAILED_NOTE}\n\n{describe_failure(e)}", title)
             sys.exit(1)
         print("Batch process completed successfully.")
 

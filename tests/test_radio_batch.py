@@ -1,4 +1,5 @@
 import datetime
+import json
 import subprocess
 
 import pytest
@@ -40,9 +41,9 @@ def feed_box(monkeypatch):
     return box
 
 
-def run_once(state, feed_box=None):
+def run_once(state, feed_box=None, config=CONFIG):
     """check_rss_feeds → select → advance_state という本番と同じ流れを1回まわす。"""
-    candidates, results, warnings = rb.check_rss_feeds(CONFIG, state)
+    candidates, results, warnings = rb.check_rss_feeds(config, state)
     selected = rb.select_articles(candidates) if candidates else []
     rb.advance_state(state, results, selected)
     return [a['title'] for a in selected], warnings
@@ -127,6 +128,79 @@ def test_per_feed_cap_is_respected(feed_box):
     feed_box['feed'] = make_feed(30)
     titles, _ = run_once(state, feed_box)
     assert len(titles) == rb.MAX_ARTICLES_PER_FEED
+
+
+# --- 同時刻の記事（日付だけのフィード: Cloudflare Changelog / Vercel / Codex 等） ----
+
+SAME_DAY = datetime.datetime(2026, 9, 22, tzinfo=UTC)
+
+
+def same_day_feed(indexes):
+    """全エントリが同じ公開時刻（日付のみ）のフィード。新しい順で返す。"""
+    return FakeFeed([FakeEntry(i, SAME_DAY) for i in reversed(indexes)])
+
+
+def test_same_timestamp_overflow_is_carried_over_not_lost(feed_box):
+    """同じ日に 7 件公開され上限で 3 件しか処理できなくても、残りは次回に持ち越される。
+
+    2026-09-22 の実測: Cloudflare Changelog の同日 7 件のうち 4 件が、透かしと同時刻という
+    理由だけで既読扱いになり、一度も処理されずに消えた。
+    """
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box)  # 初回
+
+    feed_box['feed'] = same_day_feed(range(11, 18))
+    seen = []
+    for _ in range(4):
+        titles, _ = run_once(state, feed_box)
+        seen.extend(titles)
+    assert sorted(seen) == [f'記事{i}' for i in range(11, 18)]
+    assert run_once(state, feed_box)[0] == []  # 全部処理したら、それ以上は出てこない
+
+
+def test_late_post_with_same_timestamp_is_detected(feed_box):
+    """処理済みの記事と同じ日付で後から追加された記事も、新着として検知される。"""
+    feed_box['feed'] = same_day_feed([1, 2])
+    state = {}
+    run_once(state, feed_box)  # 初回: 全既読
+
+    feed_box['feed'] = same_day_feed([1, 2, 3])
+    assert run_once(state, feed_box)[0] == ['記事3']
+    assert run_once(state, feed_box)[0] == []
+
+
+def test_many_same_timestamp_entries_do_not_oscillate(feed_box):
+    """同時刻の ID は recent_ids の上限で溢れても未読に戻らない。"""
+    feed_box['feed'] = same_day_feed(range(1, rb.MAX_RECENT_IDS + 51))
+    state = {}
+    run_once(state, feed_box)
+    for _ in range(3):
+        assert run_once(state, feed_box)[0] == []
+
+
+# --- フィードをまたいだ同一 URL（Vercel の blog/feed と atom は同一内容） -----------
+
+
+def test_duplicate_url_across_feeds_is_processed_once(monkeypatch):
+    """同じ記事を配信する 2 フィードでも投入は 1 回だけ。GUID が違っても URL で既読が両方進む。"""
+    config = {'feeds': [{'name': 'A', 'url': 'https://example.com/a'}, {'name': 'B', 'url': 'https://example.com/b'}]}
+    box = {'count': 10}
+
+    def fetch(url):
+        feed = make_feed(box['count'])
+        for e in feed.entries:
+            e.id = f'{url}#{e.id}'  # GUID はフィードごとに違うが link は同じ
+        return feed, None
+
+    monkeypatch.setattr(rb, 'fetch_feed', fetch)
+    state = {}
+    assert run_once(state, config=config)[0] == ['記事10']  # 初回も 1 件だけ
+
+    box['count'] = 11
+    assert run_once(state, config=config)[0] == ['記事11']
+    assert run_once(state, config=config)[0] == []
+    assert state['https://example.com/a']['watermark'] == state['https://example.com/b']['watermark']
 
 
 # --- 公開時刻を持たないエントリ ----------------------------------------------
@@ -843,10 +917,67 @@ def test_notification_marks_summary_only_articles(monkeypatch):
 
 def test_generate_audio_passes_prompt_and_length(monkeypatch):
     calls = []
-    monkeypatch.setattr(rb.subprocess, 'run', lambda cmd, **kw: calls.append(cmd))
+    monkeypatch.setattr(rb, 'run_notebooklm_json', lambda args, retries=1: calls.append(args) or {'status': 'pending'})
     rb.generate_audio('nb1', language='ja', prompt='対談形式で', length='long')
-    cmd = calls[0]
-    assert cmd[-1] == '対談形式で' and '--length' in cmd and 'long' in cmd
+    args = calls[0]
+    assert args[:3] == ['generate', 'audio', '--no-wait']
+    assert args[-1] == '対談形式で' and '--length' in args and 'long' in args
+
+
+def test_notification_includes_notebook_link(monkeypatch):
+    """通知からノートブックへ直接飛べる（命名規則からアプリ内で探させない）。"""
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    articles = [{'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F1', 'topic': 'AI'}]
+    notebooks = {'AI': ('Tech Radio AI 2026-09-25', 'nb-123')}
+    rb.send_notification('https://hooks.slack.com/x', articles, notebooks=notebooks)
+    text = posted[0]['text']
+    assert 'https://notebooklm.google.com/notebook/nb-123' in text and 'Tech Radio AI 2026-09-25' in text
+    assert '開始したよ' in text
+
+
+def test_notification_does_not_claim_audio_started_when_it_did_not(monkeypatch):
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    articles = [{'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F1', 'topic': 'AI'}]
+    rb.send_notification('https://hooks.slack.com/x', articles, no_audio={'AI'})
+    text = posted[0]['text']
+    assert '開始したよ' not in text and '音声は未生成' in text
+
+
+def test_audio_failure_marks_articles_read_and_reports(monkeypatch):
+    """音声生成が失敗してもソースは入っているので、記事は既読にし、失敗は別枠で報告する。
+
+    未読のまま残すと次回また同じ URL を投入して重複するだけ。CLI の封筒（rate_limited 等）が
+    通知に載ること。
+    """
+    art = {'id': 'a1', 'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F', 'topic': 'AI', 'ts': None}
+    monkeypatch.setattr(rb, 'load_config', lambda: {'feeds': [], 'settings': {}})
+    monkeypatch.setattr(rb, 'load_state', lambda: {})
+    monkeypatch.setattr(rb, 'save_state', lambda state: None)
+    monkeypatch.setattr(rb, 'check_rss_feeds', lambda config, state: ([art], [], []))
+    monkeypatch.setattr(rb, 'check_watch_pages', lambda config, state, url: [])
+    monkeypatch.setattr(rb, 'get_or_create_notebook', lambda title: 'nb1')
+    monkeypatch.setattr(rb, 'add_sources_and_wait', lambda nb, arts: (True, []))
+    monkeypatch.setattr(rb, 'run_maintenance', lambda *a: None)
+
+    def fail(*a, **kw):
+        stdout = '{"error": true, "code": "rate_limited", "message": "Daily quota may be exceeded"}'
+        raise subprocess.CalledProcessError(1, ['notebooklm', 'generate', 'audio'], output=stdout)
+
+    monkeypatch.setattr(rb, 'generate_audio', fail)
+    advanced = []
+    monkeypatch.setattr(rb, 'advance_state', lambda state, results, processed, now=None: advanced.extend(processed))
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    monkeypatch.setenv('NOTIFY_WEBHOOK_URL', 'https://hooks.slack.com/x')
+
+    with pytest.raises(SystemExit) as exc:
+        rb.main()
+    assert exc.value.code == 1
+    assert advanced == [art]  # 既読にする
+    dumped = json.dumps(posted, ensure_ascii=False)
+    assert 'rate_limited' in dumped and '音声は未生成' in dumped and 'nb1' in dumped
 
 
 # --- 失敗の説明文（Slack へ出す中身） -----------------------------------------

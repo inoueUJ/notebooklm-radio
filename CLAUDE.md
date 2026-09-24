@@ -31,7 +31,8 @@ The load-bearing design decisions and their incident history live in:
 Do not regress the invariants documented there. In particular:
 
 - **`state.json` is bot-owned.** CI commits and pushes it after every run. Never hand-edit or commit it.
-- **Never mark an article read that wasn't processed.** Overflow articles carry over; they are not dropped.
+- **Never mark an article read that wasn't processed.** Overflow articles carry over; they are not dropped. This includes entries sharing the watermark's timestamp — `recent_ids` records only processed ties, and `is_unread` treats an unrecorded same-timestamp entry as unread.
+- **The same URL published by two feeds is processed once** (`dedupe_by_link`), and `advance_state` marks it read in both feeds by URL.
 - **`advance_state` + `save_state` must run even when there are no new articles.**
 - **A feed that fails to fetch must not initialize its state.**
 - **Never loosen the cleanup title match** from full-match to substring/prefix.

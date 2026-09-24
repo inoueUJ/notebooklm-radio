@@ -51,13 +51,14 @@ An expired env-var credential makes the CLI exit **2 / `UNEXPECTED_ERROR`**, not
 
 | Signal | Meaning |
 |---|---|
-| 🎙️ article list | Episode generation **started** (not finished — audio is fire-and-forget) |
+| 🎙️ article list | Episode generation **started** (not finished — audio is fire-and-forget). Each topic heading links to its notebook. A heading marked 音声は未生成 means the sources are in but no audio was started for that topic — see the separate error message. |
 | 😪 no news | The run worked; there was nothing new. Silence, by contrast, means breakage. |
 | ⚠️ feed warning | A feed failed to fetch/parse. Its read-state was left untouched. |
 | ⚠️ bot-protection notice | Articles whose content couldn't be ingested; they are *not* in the episode |
-| 🧹 cleanup report | What was (or in dry-run, would be) deleted |
+| 🧹 cleanup report | What was (or in dry-run, would be) deleted; a 🧹 削除に失敗 line means cleanup failed and will retry next run |
+| 🚨 gate failure | The test/lint job failed, so the batch did not run at all. Fix the code; there is no episode until it is green. |
 | 🩺 monthly health check | Feeds with no new articles for 30+ days |
-| ⚠️ error + runbook | Something failed; if it's auth expiry, the fix is written in the message |
+| ⚠️ error + runbook | Something failed; if it's auth expiry, the fix is written in the message. If it says the audio could not be started, the articles are already in the notebook (and marked read) — generate the Audio Overview by hand in the app; `rate_limited` means the daily quota (3 free / 6 Plus / 20 Pro). |
 
 ## Incident log
 
@@ -69,4 +70,16 @@ The design rationale in this repo is earned. Dates preserved from the original p
 
 **2026-07 — the shared sitemap key.** Two feeds reading different prefixes of the same sitemap shared one state entry; one feed's articles were silently marked read by the other. Fix: the prefix became part of the state key.
 
+**2026-07-23 → 2026-08-01 — the first credential expiry.** The initial CI secret lasted about 15 days; every run failed with exit 2 and an error notification, and the cause (expiry) was only understood after the second, worse outage below.
+
 **2026-08-05 → 2026-08-21 — the 16-day silence.** The frozen CI credential expired; the CLI exited 2/`UNEXPECTED_ERROR`, which read as "some bug" rather than "credentials", and the batch died quietly every day. Fixes: error envelope parsing in notifications, the auth-expiry hint with the runbook, the no-news heartbeat (so silence is always abnormal), and the dedicated `ci` profile (the first replacement secret, shared with the default profile, died in 3 days).
+
+**2026-08-11 → 08-13 and 2026-08-21 → 08-30 — the silent gate.** The batch job depends on the test job. A date-dependent test, then three lint errors in files the batch does not even use, failed the gate for 25 runs; the batch never ran, so there was no error notification and no heartbeat — the one kind of silence the heartbeat was meant to make impossible. Fix: the test job now posts a 🚨 message to the webhook when it fails.
+
+**2026-08 — state lost on failed runs.** The state-push step only ran when the batch succeeded, but `main()` saves read-state for the topics that succeeded before exiting non-zero. During the auth outage the same 11 watch-page updates were re-announced on every failed run. Fix: the push step runs whenever the batch step ran, success or failure.
+
+**2026-09-22 — the same-timestamp loss.** Cloudflare Changelog published 7 entries in one day; date-only feeds give them all the same midnight timestamp. The per-feed limit processed 3, and the other 4 were recorded as read because the code treated *every* entry at the watermark time as a tie. Fix: an entry at the watermark time is unread unless its ID was actually processed (`docs/DESIGN.md`).
+
+**2026-09 — the Vercel double.** `vercel.com/blog/feed` and `vercel.com/atom` return identical content. Every Vercel article was added as two sources, listed twice, and used two of the 15 per-run slots, on 26 of 27 runs with articles. Fix: cross-feed URL deduplication; both feeds still advance.
+
+**2026-09 — audio failure left articles unread.** If `generate audio` failed after the sources were added, the topic counted as failed and its articles stayed unread, so the next run re-added the same URLs. Fix: those articles are marked read and the failure is reported separately with the CLI's error code, so a daily-quota rejection (`rate_limited`) is visible instead of an opaque exit code.
