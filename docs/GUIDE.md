@@ -51,17 +51,21 @@ The wizard in [section 5](#5-run-the-setup-wizard) tells you which of these are 
 
 ## 3. Build your config
 
-The whole configuration is one file, `config.yaml`. You can write it by hand, but the **[config builder](https://inoueuj.github.io/tech-feed-catalog/)** warns you about the things that bite later. It runs entirely in your browser and sends nothing anywhere, except that checking a feed outside the catalog is done by that site's worker on your behalf.
+The whole configuration is one file, `config.yaml`. You can write it by hand, but the **[config builder](https://inoueuj.github.io/tech-feed-catalog/)** warns you about the things that bite later. It runs entirely in your browser and sends nothing anywhere, except that checking a feed outside the catalog is done by that site's worker on your behalf. Japanese and English switch at the top right.
 
-**Step 1 — pick feeds.** Tick feeds from a catalog of 76 that CI re-validates weekly. ★★★ means long-form posts that make good radio; ★ means one-line changelog entries. Anything not listed can be added at the top: a Zenn topic, a Zenn user, a Qiita tag, or any feed URL. **Check** fetches it once and reports whether it really is a feed, how many entries it returns, whether they carry timestamps, and roughly how many posts per month.
+It opens in a guided mode with four steps.
 
-**Step 2 — group into notebooks.** Feeds land in a box per topic. Rename boxes freely and move feeds between them with the dropdown. The rule of thumb: would these sound right in one show? Model announcements and Cloudflare changelog entries don't. Per box, choose the conversation format (deep-dive / brief / critique / debate), the length, and the focus instructions; the default instructions are built from "your stack" in step 3. Firehose feeds (Hacker News, aggregators) get **newest only** automatically: take the newest N each run and mark the rest read, instead of airing week-old items forever.
+**1. What do you follow?** Tap technology chips (Claude, Rust, Next.js, Cloudflare, Japanese engineering blogs …) and their feeds drop in; the counter at the top right ticks up. Anything not in the catalog can be added at the bottom of the same step: a Zenn topic, a Zenn user, a Qiita tag, or any feed URL. **Check** fetches it once and reports whether it really is a feed, how many entries it returns, whether they carry timestamps, and roughly how many posts per month.
 
-**Step 3 — basics.** Language, timezone, run times, and your NotebookLM plan. The plan shows "notebooks × runs = Audio Overviews per day" and turns red when you exceed the cap; merge notebooks or turn off the second run.
+**2. Group into shows.** Feeds land in a box per show (= one NotebookLM notebook = one episode a day). The rule of thumb: would these sound right in one show? Model announcements and Cloudflare changelog entries don't. Rename boxes freely; move feeds with the dropdown. Per box, pick a style: *In depth* (a long two-host deep dive) or *Brief*, or open *Custom* for the exact format, length and instructions. Firehose feeds (Hacker News, aggregators) get **newest only** automatically: take the newest N each run and mark the rest read, instead of airing week-old items forever.
 
-**Step 4 — output.** The `config.yaml` tab is the complete file: **Download** it. The `cron` tab has the two schedule lines already converted to UTC (GitHub's cron only speaks UTC). **Share link** copies a URL that restores the whole setup; the same browser also remembers it across reloads.
+**3. When do you listen?** Audio language, timezone, the morning time and an optional second run, and your NotebookLM plan. The plan shows "shows × runs = episodes per day" and turns red when you exceed the cap; merge shows or turn off the second run. "Your stack" goes into the default instructions.
+
+**4. Done.** The complete `config.yaml` and the two schedule lines already converted to UTC (GitHub's cron only speaks UTC). **Download** the file and copy the cron lines. **Share link** copies a URL that restores the whole setup; the same browser also remembers it across reloads.
 
 The "things to know" panel lists: feeds CI can't fetch, hosts that refuse bots, two feeds that publish the same articles (subscribing to both adds every article twice), summary-only feeds, and volumes your limits can't absorb.
+
+"Browse the list" at the top right switches to the classic view: all 76 catalog feeds, filterable by category and volume, with checkboxes. The selection is shared between the two modes. Use it if you only want an OPML file or a list of feed URLs.
 
 ## 4. Create the repository and drop the config in
 
