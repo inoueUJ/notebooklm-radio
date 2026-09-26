@@ -31,6 +31,17 @@ flowchart LR
 
 Details that took real incidents to get right (1,226 falsely-new articles, a 16-day silent auth outage) are documented in [docs/DESIGN.md](docs/DESIGN.md) and [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
+## Where to look
+
+| You want to… | Read |
+|---|---|
+| Get running in five minutes | The quick start below |
+| Understand the whole thing, change settings, read the notifications, fix a problem | **[docs/GUIDE.md](docs/GUIDE.md)** (the user guide, start to finish) |
+| Pick feeds and generate a config | [The config builder](https://inoueuj.github.io/tech-feed-catalog/) |
+| Know every key config.yaml accepts | [config.schema.json](config.schema.json) |
+| Know why it is built this way | [docs/DESIGN.md](docs/DESIGN.md) |
+| Renew the credential, read the incident log | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+
 ## Quick start
 
 You need: a GitHub account, a Google account with NotebookLM access, a Slack or Discord webhook (step 4 tells you where to get one), and a machine with a browser for the one-time login. Locally you need [uv](https://docs.astral.sh/uv/getting-started/installation/) and the [GitHub CLI](https://cli.github.com/) (`gh auth login` once); the wizard in step 4 checks for both and tells you what's missing.

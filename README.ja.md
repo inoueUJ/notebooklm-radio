@@ -31,6 +31,17 @@ flowchart LR
 
 「1,226 件の誤新着」「16 日間の無音認証切れ」といった実際の事故から得た設計は [docs/DESIGN.md](docs/DESIGN.md) と [docs/OPERATIONS.md](docs/OPERATIONS.md) に記録しています。
 
+## どこを読むか
+
+| したいこと | 読むところ |
+|---|---|
+| とにかく 5 分で動かす | 下のクイックスタート |
+| 全体を理解する、設定を変える、通知を読む、困ったときに直す | **[docs/GUIDE.ja.md](docs/GUIDE.ja.md)**(使い方ガイド。最初から最後まで 1 本) |
+| フィードを選んで設定を作る | [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) |
+| config.yaml で使えるキーを全部知る | [config.schema.json](config.schema.json) |
+| なぜこの作りなのかを知る | [docs/DESIGN.md](docs/DESIGN.md) |
+| 認証の更新、事故の記録 | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+
 ## クイックスタート
 
 必要なもの: GitHub アカウント、NotebookLM が使える Google アカウント、Slack か Discord の webhook(取り方は手順 4 に書いてあります)、初回ログイン用のブラウザが動く PC。ローカルには [uv](https://docs.astral.sh/uv/getting-started/installation/) と [GitHub CLI](https://cli.github.com/)(一度 `gh auth login`)が必要です。手順 4 のウィザードが両方を確認して、足りないものを教えてくれます。
