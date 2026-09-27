@@ -1,105 +1,105 @@
 # notebooklm-radio
 
-**Your daily tech news, as a podcast you didn't have to make.**
+**毎朝の技術ニュースを、作らなくていいポッドキャストに。**
 
-[日本語版 README はこちら](README.ja.md)
+[English README](README.en.md)
 
-notebooklm-radio polls the RSS feeds and sitemaps you care about, and every morning turns the new articles into a NotebookLM **Audio Overview** — a two-host conversational radio show, in your language — then pings you on Slack or Discord with what's in today's episode. It runs entirely on GitHub Actions cron: no server, no database, nothing to keep alive.
+notebooklm-radio は、あなたが追いたい RSS フィードやサイトマップを巡回し、新着記事を毎朝 NotebookLM の**音声概要**(2人のホストが語り合うラジオ形式、言語は選択可)に変換して、今日のエピソードの内容を Slack / Discord に通知します。GitHub Actions の cron だけで完結し、サーバーもデータベースも不要です。
 
-Built for one concrete itch: *English tech articles pile up faster than you can read them, but your commute has 40 free minutes of ears.* Japanese-first by default (the author listens in Japanese), works in any language NotebookLM supports.
+動機はひとつの具体的な悩みでした — *英語の技術記事は読む速度より速く積み上がるが、通勤には40分の「耳の空き時間」がある。* 既定は日本語ですが、NotebookLM が対応する言語なら何語でも使えます。
 
-**→ [Setup guide with screenshots](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)** — ten steps from picking feeds to your first episode, plus what to do every morning and every 3.5 weeks. [日本語版](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja). Feeds come from **[tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog)** ([builder](https://inoueuj.github.io/tech-feed-catalog/) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json)).
+**→ [スクリーンショット付きの導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)** — フィード選びから最初の 1 本まで 10 ステップ、毎朝の見方と 3.5 週ごとの更新まで。[English](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)。フィードは **[tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog)** から([設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json))。
 
-## ⚠️ Read this before using
+## ⚠️ 使う前に読んでください
 
-- This project drives NotebookLM through [notebooklm-py](https://github.com/teng-lin/notebooklm-py), an **unofficial, reverse-engineered client**. Google can change or break NotebookLM at any time, without notice, and this whole pipeline with it.
-- It authenticates with **your own Google session cookies**, stored as a GitHub Actions secret in **your own repository**. This template never sends your credentials anywhere else, and it is designed for **personal use with your own account only** — it is not a service, and it must not become one that holds other people's credentials.
-- The session expires roughly every **3.5 weeks** and must be renewed by hand (2 minutes; there is a runbook). This is a structural limitation, not a bug — [docs/OPERATIONS.md](docs/OPERATIONS.md) explains why it cannot renew itself.
-- Generated audio summarizes other people's articles. Keep it for **personal listening**; do not republish episodes as your own podcast.
+- このプロジェクトは [notebooklm-py](https://github.com/teng-lin/notebooklm-py) という**非公式のリバースエンジニアリング製クライアント**で NotebookLM を操作します。Google は予告なく NotebookLM を変更でき、その日このパイプライン全体が止まる可能性があります。
+- 認証には**あなた自身の Google セッション Cookie** を使い、**あなた自身のリポジトリ**の GitHub Actions シークレットに保存します。認証情報が他所へ送られることはありません。**自分のアカウントでの個人利用専用**であり、他人の認証情報を預かるサービスにしてはいけません。
+- セッションは約 **3.5 週間**で失効し、手動での再ログインが必要です(2分で終わる手順書つき)。これはバグではなく構造的な制約です — 理由は [docs/OPERATIONS.md](docs/OPERATIONS.md) に書いてあります。
+- 生成される音声は他者の記事の要約です。**個人で聴く用途**にとどめ、エピソードを自分のポッドキャストとして再配信しないでください。
 
-## How it works
+## 仕組み
 
 ```mermaid
 flowchart LR
-    A[GitHub Actions cron<br/>2x daily] --> B[Poll RSS feeds<br/>and sitemaps]
-    B --> C{New articles?}
-    C -- no --> D[😪 no-news ping<br/>so silence = breakage]
-    C -- yes --> E[Daily notebook per topic<br/>Tech Radio AI 2026-08-31]
-    E --> F[Add articles as sources<br/>detect & remove bot-challenge junk]
-    F --> G[Trigger Audio Overview<br/>in your language]
-    G --> H[🎙️ Slack/Discord ping<br/>with today's article list]
-    B --> I[state.json committed back<br/>watermark / seen-set read-state]
+    A[GitHub Actions cron<br/>1日2回] --> B[RSS / sitemap を巡回]
+    B --> C{新着あり?}
+    C -- なし --> D[😪 新着なし通知<br/>沈黙=故障と分かるように]
+    C -- あり --> E[トピック別の日次ノートブック<br/>Tech Radio AI 2026-08-31]
+    E --> F[記事をソースとして追加<br/>ボット対策ページは検出して除去]
+    F --> G[音声概要の生成をトリガー]
+    G --> H[🎙️ Slack/Discord に<br/>今日の記事リストを通知]
+    B --> I[state.json を bot がコミット<br/>watermark / seen-set の既読管理]
 ```
 
-Details that took real incidents to get right (1,226 falsely-new articles, a 16-day silent auth outage) are documented in [docs/DESIGN.md](docs/DESIGN.md) and [docs/OPERATIONS.md](docs/OPERATIONS.md).
+「1,226 件の誤新着」「16 日間の無音認証切れ」といった実際の事故から得た設計は [docs/DESIGN.md](docs/DESIGN.md) と [docs/OPERATIONS.md](docs/OPERATIONS.md) に記録しています。
 
-## Where to look
+## どこを読むか
 
-| You want to… | Read |
+| したいこと | 読むところ |
 |---|---|
-| Set it up step by step, with screenshots | **[The setup guide](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)** (web page, English / [日本語](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)) |
-| Get running in five minutes | The quick start below |
-| Read the same guide as one Markdown file (grep-able), change settings, read the notifications, fix a problem | [docs/GUIDE.md](docs/GUIDE.md) |
-| Pick feeds and generate a config | [The config builder](https://inoueuj.github.io/tech-feed-catalog/) |
-| Browse the validated feed catalog (70+ developer feeds, checked weekly) | [tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json) |
-| Know every key config.yaml accepts | [config.schema.json](config.schema.json) |
-| Know why it is built this way | [docs/DESIGN.md](docs/DESIGN.md) |
-| Renew the credential, read the incident log | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+| 手順をスクリーンショット付きで追う | **[導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)**(Web ページ。日本語 / [English](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)) |
+| とにかく 5 分で動かす | 下のクイックスタート |
+| 同じ内容を Markdown 1 枚で読む(検索用)、設定を変える、通知を読む、困ったときに直す | [docs/GUIDE.ja.md](docs/GUIDE.ja.md) |
+| フィードを選んで設定を作る | [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) |
+| 検証済みのフィード一覧を見る(開発者向け 70 以上のフィード、毎週生存確認) | [tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json) |
+| config.yaml で使えるキーを全部知る | [config.schema.json](config.schema.json) |
+| なぜこの作りなのかを知る | [docs/DESIGN.md](docs/DESIGN.md) |
+| 認証の更新、事故の記録 | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
 
-## Quick start
+## クイックスタート
 
-The full walkthrough with screenshots is **[the setup guide](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)**. The short version:
+スクリーンショット付きの手順は **[導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)** にあります。短くまとめると:
 
-1. **Build your config** in [the builder](https://inoueuj.github.io/tech-feed-catalog/): tap the feeds you follow (or add a Zenn topic, a Qiita tag, any feed URL), group them into shows, choose when to listen, then download `config.yaml` and copy the two cron lines. The page warns about the daily Audio Overview quota vs. shows × runs, firehose feeds, duplicate feeds and bot-blocked hosts before they bite.
-2. **Use this template → Create a new repository**, **Private** (the bot commits your read-state to `state.json`), then clone it.
-3. **Drop the config in**: replace `config.yaml` with the downloaded file and the two `- cron:` lines in `.github/workflows/rss-radio.yml` with the builder's, check it with `python radio_batch.py --check-config` (reads the file, runs nothing), and push.
-4. **Run the wizard once** on your PC (needs Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/) and the [GitHub CLI](https://cli.github.com/) after `gh auth login`; the wizard tells you what is missing):
+1. **設定を作る** — [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) で、追っている技術を押す(Zenn のトピック・Qiita のタグ・任意のフィード URL も足せる)→ 番組に分ける → いつ聴くか決める → `config.yaml` をダウンロードし、cron の 2 行をコピー。1 日の音声生成上限と番組数 × 実行回数の関係、流量の多いフィード、同じ記事を配信する 2 フィード、ボット対策のホストは、ビルダーが先に警告します。
+2. **Use this template → Create a new repository** で自分のコピーを作る。**Private** を選ぶ(bot が購読履歴を `state.json` にコミットするため)。clone する。
+3. **設定を入れる** — `config.yaml` をダウンロードしたファイルで置き換え、`.github/workflows/rss-radio.yml` の `- cron:` 2 行をビルダーの 2 行に差し替える。`python radio_batch.py --check-config` で検査(ファイルを読むだけで何も実行しない)して push。
+4. **ウィザードを一度だけ走らせる**(PC に Python 3.10 以上、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[GitHub CLI](https://cli.github.com/)(`gh auth login` 済み)が必要。足りなければウィザードが教えてくれます):
 
    ```bash
    python scripts/setup.py
    ```
 
-   It installs the pinned `notebooklm` CLI, opens a browser for a Google login into a CI-only `ci` profile (kept apart from your everyday profile, which stretches the credential's life from ~3 days to ~3.5 weeks — see [docs/OPERATIONS.md](docs/OPERATIONS.md)), stores that session as the `NOTEBOOKLM_AUTH_JSON` secret, asks for your Slack or Discord webhook URL and stores it as `NOTIFY_WEBHOOK_URL`, and starts the first run. Nothing about the credential is printed. `python scripts/setup.py doctor` runs the checks only.
-5. **Listen.** Within minutes a notification lists today's articles with a link to each notebook; the audio is ready in [NotebookLM](https://notebooklm.google.com) about 20 minutes later. The first run processes only the newest article per feed and marks the backlog read (no flood). After about a week, when the 🧹 dry-run message lists only old episodes, set `cleanup.dry_run: false`.
+   ピン留めされた版の `notebooklm` CLI を入れ、ブラウザを開いて CI 専用の `ci` プロファイルに Google ログインし(普段使いと分けることで認証情報の寿命が約 3 日 → 約 3.5 週間に延びます。[docs/OPERATIONS.md](docs/OPERATIONS.md) 参照)、そのセッションを `NOTEBOOKLM_AUTH_JSON` シークレットに登録し、Slack / Discord の webhook URL を聞いて `NOTIFY_WEBHOOK_URL` に登録し、最初の実行を起動します。認証情報の中身は画面に出ません。`python scripts/setup.py doctor` は確認だけをして何も変えません。
+5. **聴く** — 数分で、今日の記事一覧と各ノートブックへのリンク付きの通知が届き、[NotebookLM](https://notebooklm.google.com) の中で 20 分ほどかけて音声ができます。初回は既読状態の初期化として各フィード最新 1 件だけを処理し、過去分は既読になります(洪水は起きません)。1 週間ほど経って 🧹 の削除対象リストが古いラジオだけなら、`cleanup.dry_run: false` にしてください。
 
-That is the whole setup; from here on it runs by itself. `state.json` is written and committed by the bot — never edit it by hand. Every ~3.5 weeks the Google session expires and the error notification says so; the fix is `python scripts/setup.py renew` (two minutes).
+セットアップはこれで全部です。以後は勝手に回ります。`state.json` は bot が作ってコミットします — 手で編集しないでください。約 3.5 週間ごとに Google のセッションが切れ、エラー通知が届きます。直し方は `python scripts/setup.py renew`(2 分ほど)です。
 
-## Configuration reference
+## 設定リファレンス
 
-Everything lives in `config.yaml` (annotated inline):
+すべて `config.yaml` にあります(インラインの注釈つき):
 
-| Key | What it does |
+| キー | 何をするか |
 |---|---|
-| `feeds[].topic` | One notebook + one radio per topic per day. Mixing unrelated topics makes the show incoherent — split them. |
-| `feeds[].type: sitemap` | For sites with no RSS: reads `sitemap.xml`, treats URLs under `prefix` as articles. |
-| `feeds[].source_mode: text` | For hosts that block NotebookLM's fetcher with a bot challenge: submits the RSS summary as text instead of the URL, clearly labeled as summary-only. |
-| `feeds[].mode: latest` | For aggregators and other firehoses: each run takes only the newest N and deliberately marks the rest read, instead of draining a backlog oldest-first. |
-| `topics.<name>.audio` | Per-topic Audio Overview overrides — `format` (deep-dive / brief / critique / debate), `length`, `prompt`, `language`. |
-| `settings.notebook_title_format` | Cleanup only deletes notebooks whose title **fully matches** this — your manual notebooks are structurally safe. |
-| `settings.timezone` | Notebook dates and monthly checks. Runners are UTC; set your own. |
-| `settings.limits` | Articles per run. Overflow is carried over to the next run, never dropped. |
-| `settings.audio` | Global Audio Overview settings: `format`, `length`, `prompt`, and `scope` (`run`, the default: each episode covers only that run's articles; `notebook`: the whole day). |
-| `settings.cleanup` | Auto-delete of old daily notebooks. Ships with `dry_run: true` — flip only after the would-delete list looks right. |
-| `watch:` | Notification-only page monitoring (never becomes radio). |
+| `feeds[].topic` | トピックごとに 1 日 1 ノートブック + 1 ラジオ。無関係な話題を混ぜると番組が散らかるので分ける。 |
+| `feeds[].type: sitemap` | RSS の無いサイト向け。`sitemap.xml` を読み、`prefix` 配下の URL を記事として扱う。 |
+| `feeds[].source_mode: text` | ボット対策で NotebookLM のフェッチャーが弾かれるホスト向け。URL の代わりに RSS の要約をテキスト投入し、「要約のみ」と明示する。 |
+| `feeds[].mode: latest` | アグリゲータなど流量の多いフィード向け。毎回最新 N 件だけ拾い、残りは意図的に既読にする(既定の backlog は古い順に消化して何も捨てない)。 |
+| `topics.<name>.audio` | トピック別の音声設定の上書き — `format`(deep-dive / brief / critique / debate)、`length`、`prompt`、`language`。 |
+| `settings.notebook_title_format` | 自動削除はこの形式に**完全一致**するタイトルだけが対象。手動で作ったノートブックには構造的に触れない。 |
+| `settings.timezone` | ノートブックの日付と月次判定の基準。runner は UTC なので必ず自分のものを。 |
+| `settings.limits` | 1 回に処理する記事数。超過分は捨てずに次回へ持ち越し。 |
+| `settings.audio` | 全体の音声設定: `format`、`length`、`prompt`、`scope`(既定 `run`: その回に入れた記事だけで 1 本。`notebook`: その日のノートブック全体)。 |
+| `settings.cleanup` | 古い日次ノートブックの自動削除。`dry_run: true` で出荷 — 削除予定リストが正しいのを確認してから false に。 |
+| `watch:` | 通知だけのページ監視(ラジオ化はしない)。 |
 
-Validate your edits without running anything: `python radio_batch.py --check-config`. It reads only `config.yaml` — no network, no NotebookLM — and CI runs the same check before every batch, so a typo (`feed:` instead of `feeds:`, `topics:` inside a feed) stops with a readable message instead of silently falling back to defaults. The full shape is documented in [`config.schema.json`](config.schema.json).
+編集した設定は何も実行せずに検査できます: `python radio_batch.py --check-config`。`config.yaml` を読むだけで、ネットワークにも NotebookLM にも触れません。CI も毎回 batch の前に同じ検査を走らせるので、typo(`feeds:` を `feed:`、フィード内に `topics:`)は既定値に黙って落ちず、読めるメッセージで止まります。設定の全体像は [`config.schema.json`](config.schema.json) にあります。
 
-## Operations
+## 運用
 
-- **Auth expires ~every 3.5 weeks.** You'll get an error notification naming the cause; recovery is re-running step 2 and step 3's first command. Full runbook: [docs/OPERATIONS.md](docs/OPERATIONS.md).
-- **Silence means breakage.** A no-news day still sends a 😪 ping. If you hear nothing at all, check the Actions tab.
-- **Audio generation is fire-and-forget.** The notification says generation *started*; a failed render on Google's side does not fail the run. If generation can't even be *started* (typically NotebookLM's daily Audio Overview quota: 3 on the free tier), the articles are still in the notebook and you get a separate error message with the cause — generate the overview by hand in the app.
-- **Private repos and Actions minutes:** two runs/day fits comfortably in the free tier (runs are typically a few minutes; 30 min is a worst-case timeout), but keep an eye on your usage.
+- **認証は約 3.5 週間で切れます。** 原因を名指しするエラー通知が届くので、手順 2 と手順 3 の 1 行目をやり直せば復旧します。手順書: [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+- **沈黙は故障です。** 新着ゼロの日も 😪 の通知が来ます。何も来なければ Actions タブを確認。
+- **音声生成は fire-and-forget。** 通知は「生成を開始した」であり、Google 側でレンダリングが失敗しても実行は失敗になりません。生成の*開始*自体に失敗した場合（多くは NotebookLM の 1 日あたりの音声生成上限。無料枠は 3 本）は、記事はノートブックに入った状態で、原因を添えた別のエラー通知が届きます。アプリから手動で生成してください。
+- **Private リポジトリの Actions 無料枠:** 1 日 2 回なら余裕で収まります(実行は通常数分。30 分はワーストケースのタイムアウト)が、使用量には気を配ってください。
 
-## Design notes
+## 設計ノート
 
-The interesting engineering is in the read-state: RSS feeds use a **watermark** (last processed publish time) while sitemap feeds use a **seen-URL set**, and each choice is wrong for the other type in ways that produced real incidents. That story, plus the bot-challenge detection and the things this project deliberately does *not* do (spoof User-Agents, grow a plugin system), is in [docs/DESIGN.md](docs/DESIGN.md).
+エンジニアリング的に面白いのは既読管理です。RSS フィードは **watermark**(最後に処理した記事の公開時刻)、sitemap フィードは **既読 URL 集合**を使っており、どちらの方式も相手のフィード型に使うと実際の事故につながります。その顛末、ボット対策ページの検出、そしてこのプロジェクトが**あえてやらないこと**(User-Agent 偽装、プラグインシステム化)は [docs/DESIGN.md](docs/DESIGN.md) にあります。
 
-## Support
+## サポート
 
-Best-effort. Issues and PRs are welcome, but this is one person's morning radio that happens to be shareable — expect honest answers, not SLAs. If NotebookLM changes upstream, expect breakage until notebooklm-py catches up.
+ベストエフォートです。issue も PR も歓迎ですが、これは「たまたま共有できる形にした、ひとりの朝のラジオ」です — 誠実な返答はしますが SLA はありません。NotebookLM 側が変われば、notebooklm-py が追従するまで止まります。
 
-## Credits & license
+## クレジットとライセンス
 
-- Powered by [notebooklm-py](https://github.com/teng-lin/notebooklm-py) (MIT) by Teng Lin — the unofficial NotebookLM CLI this project shells out to. Consider starring it; nothing here works without it.
-- License: [MIT](LICENSE).
+- Powered by [notebooklm-py](https://github.com/teng-lin/notebooklm-py) (MIT) by Teng Lin — このプロジェクトが呼び出している非公式 NotebookLM CLI です。ここにあるものは何ひとつ、これ無しでは動きません。スターを送りましょう。
+- ライセンス: [MIT](LICENSE)
