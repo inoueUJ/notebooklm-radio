@@ -1,21 +1,30 @@
 # notebooklm-radio
 
-**毎朝の技術ニュースを、作らなくていいポッドキャストに。**
+追いかけている技術ブログの新着を、毎朝 NotebookLM のラジオにして届ける仕組みです。GitHub Actions の cron だけで動くので、サーバーもデータベースも要りません。
 
 [English README](README.en.md)
 
-notebooklm-radio は、あなたが追いたい RSS フィードやサイトマップを巡回し、新着記事を毎朝 NotebookLM の**音声概要**(2人のホストが語り合うラジオ形式、言語は選択可)に変換して、今日のエピソードの内容を Slack / Discord に通知します。GitHub Actions の cron だけで完結し、サーバーもデータベースも不要です。
+## これは何
 
-動機はひとつの具体的な悩みでした — *英語の技術記事は読む速度より速く積み上がるが、通勤には40分の「耳の空き時間」がある。* 既定は日本語ですが、NotebookLM が対応する言語なら何語でも使えます。
+登録した RSS や sitemap を巡回して、新着記事があれば NotebookLM の音声概要(2 人のホストが会話する形式の音声)を生成し、今日のエピソードに入った記事の一覧を Slack か Discord に流します。
 
-**→ [スクリーンショット付きの導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)** — フィード選びから最初の 1 本まで 10 ステップ、毎朝の見方と 3.5 週ごとの更新まで。[English](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)。フィードは **[tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog)** から([設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json))。
+作った動機は単純で、英語の技術記事が読むより速く溜まっていく一方で、通勤の 40 分は耳が空いていたからです。音声の言語は既定で日本語ですが、NotebookLM が対応している言語なら変えられます。
 
-## ⚠️ 使う前に読んでください
+手順はスクリーンショット付きで別のページにまとめてあります。
 
-- このプロジェクトは [notebooklm-py](https://github.com/teng-lin/notebooklm-py) という**非公式のリバースエンジニアリング製クライアント**で NotebookLM を操作します。Google は予告なく NotebookLM を変更でき、その日このパイプライン全体が止まる可能性があります。
-- 認証には**あなた自身の Google セッション Cookie** を使い、**あなた自身のリポジトリ**の GitHub Actions シークレットに保存します。認証情報が他所へ送られることはありません。**自分のアカウントでの個人利用専用**であり、他人の認証情報を預かるサービスにしてはいけません。
-- セッションは約 **3.5 週間**で失効し、手動での再ログインが必要です(2分で終わる手順書つき)。これはバグではなく構造的な制約です — 理由は [docs/OPERATIONS.md](docs/OPERATIONS.md) に書いてあります。
-- 生成される音声は他者の記事の要約です。**個人で聴く用途**にとどめ、エピソードを自分のポッドキャストとして再配信しないでください。
+- 導入ガイド: https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja ([English](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en))
+- フィード選びと `config.yaml` の生成: [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/)
+- フィードの元データ: [tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog)([feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json))
+
+## 使う前に知っておいてほしいこと
+
+NotebookLM には公式の API がありません。このプロジェクトは [notebooklm-py](https://github.com/teng-lin/notebooklm-py) という非公式クライアント(リバースエンジニアリングで作られたもの)で NotebookLM を操作しています。Google 側の変更で、ある日突然まるごと動かなくなる可能性があります。
+
+認証には自分の Google アカウントのセッション Cookie を使い、自分のリポジトリの GitHub Actions シークレットに保存します。外部に送られることはありませんが、その代わり自分のアカウントで個人的に使う前提の作りです。他人の認証情報を預かるようなサービスにはしないでください。
+
+セッションは 3.5 週間ほどで切れます。切れたらブラウザでログインし直してシークレットを更新する必要があります(2 分くらいで済む手順を用意しています)。これはバグではなく、仕組み上どうにもならない制約です。理由は [docs/OPERATIONS.md](docs/OPERATIONS.md) に書きました。
+
+生成される音声は他人の記事を要約したものです。自分で聴く範囲にとどめて、ポッドキャストとして再配信するのはやめてください。
 
 ## 仕組み
 
@@ -31,75 +40,79 @@ flowchart LR
     B --> I[state.json を bot がコミット<br/>watermark / seen-set の既読管理]
 ```
 
-「1,226 件の誤新着」「16 日間の無音認証切れ」といった実際の事故から得た設計は [docs/DESIGN.md](docs/DESIGN.md) と [docs/OPERATIONS.md](docs/OPERATIONS.md) に記録しています。
+「1,226 件の記事が新着扱いになった」「認証が切れたまま 16 日間気づかなかった」といった実際の事故と、そこから決めた設計は [docs/DESIGN.md](docs/DESIGN.md) と [docs/OPERATIONS.md](docs/OPERATIONS.md) に残してあります。
 
-## どこを読むか
+## どこを読めばいいか
 
 | したいこと | 読むところ |
 |---|---|
-| 手順をスクリーンショット付きで追う | **[導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)**(Web ページ。日本語 / [English](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)) |
-| とにかく 5 分で動かす | 下のクイックスタート |
-| 同じ内容を Markdown 1 枚で読む(検索用)、設定を変える、通知を読む、困ったときに直す | [docs/GUIDE.ja.md](docs/GUIDE.ja.md) |
-| フィードを選んで設定を作る | [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) |
-| 検証済みのフィード一覧を見る(開発者向け 70 以上のフィード、毎週生存確認) | [tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json) |
-| config.yaml で使えるキーを全部知る | [config.schema.json](config.schema.json) |
-| なぜこの作りなのかを知る | [docs/DESIGN.md](docs/DESIGN.md) |
-| 認証の更新、事故の記録 | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+| 手順をスクリーンショット付きで追いたい | [導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)(Web ページ。[English](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en) もあります) |
+| とにかく 5 分で動かしたい | 下のクイックスタート |
+| 同じ内容を Markdown 1 枚で読みたい。設定の変え方、通知の読み方、困ったときの直し方 | [docs/GUIDE.ja.md](docs/GUIDE.ja.md) |
+| フィードを選んで設定を作りたい | [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) |
+| 生存確認済みのフィード一覧を見たい(開発者向けに 70 以上、毎週チェック) | [tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog)([feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json)) |
+| `config.yaml` で使えるキーを全部知りたい | [config.schema.json](config.schema.json) |
+| なぜこういう作りなのか知りたい | [docs/DESIGN.md](docs/DESIGN.md) |
+| 認証の更新手順と、これまでの事故の記録 | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
 
 ## クイックスタート
 
-スクリーンショット付きの手順は **[導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)** にあります。短くまとめると:
+詳しい手順はスクリーンショット付きの[導入ガイド](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)にあります。流れだけ書くと次のとおりです。
 
-1. **設定を作る** — [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/) で、追っている技術を押す(Zenn のトピック・Qiita のタグ・任意のフィード URL も足せる)→ 番組に分ける → いつ聴くか決める → `config.yaml` をダウンロードし、cron の 2 行をコピー。1 日の音声生成上限と番組数 × 実行回数の関係、流量の多いフィード、同じ記事を配信する 2 フィード、ボット対策のホストは、ビルダーが先に警告します。
-2. **Use this template → Create a new repository** で自分のコピーを作る。**Private** を選ぶ(bot が購読履歴を `state.json` にコミットするため)。clone する。
-3. **設定を入れる** — `config.yaml` をダウンロードしたファイルで置き換え、`.github/workflows/rss-radio.yml` の `- cron:` 2 行をビルダーの 2 行に差し替える。`python radio_batch.py --check-config` で検査(ファイルを読むだけで何も実行しない)して push。
-4. **ウィザードを一度だけ走らせる**(PC に Python 3.10 以上、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[GitHub CLI](https://cli.github.com/)(`gh auth login` 済み)が必要。足りなければウィザードが教えてくれます):
+1. [設定ビルダー](https://inoueuj.github.io/tech-feed-catalog/)で設定を作ります。追っている技術を選び(Zenn のトピックや Qiita のタグ、任意のフィード URL も足せます)、番組の分け方と実行時刻を決めると、`config.yaml` と cron の 2 行が出てきます。1 日の音声生成上限に対して番組数 × 実行回数が多すぎる、流量の多すぎるフィードがある、同じ記事を配信するフィードを 2 つ選んでいる、といったことはこの時点で警告されます。
+2. このリポジトリの「Use this template」から自分のリポジトリを作ります。bot が購読履歴(`state.json`)をコミットし続けるので、Private にしておいてください。作ったら clone します。
+3. `config.yaml` をビルダーで作ったものに置き換え、`.github/workflows/rss-radio.yml` の `- cron:` の 2 行も差し替えます。`python radio_batch.py --check-config` で設定ファイルの検査だけができます(ネットワークにも NotebookLM にも触りません)。push まで済ませてください。
+4. 手元の PC でウィザードを一度だけ実行します。Python 3.10 以上と [uv](https://docs.astral.sh/uv/getting-started/installation/)、[GitHub CLI](https://cli.github.com/)(`gh auth login` 済み)が必要です。足りないものがあればウィザードが教えてくれます。
 
    ```bash
    python scripts/setup.py
    ```
 
-   ピン留めされた版の `notebooklm` CLI を入れ、ブラウザを開いて CI 専用の `ci` プロファイルに Google ログインし(普段使いと分けることで認証情報の寿命が約 3 日 → 約 3.5 週間に延びます。[docs/OPERATIONS.md](docs/OPERATIONS.md) 参照)、そのセッションを `NOTEBOOKLM_AUTH_JSON` シークレットに登録し、Slack / Discord の webhook URL を聞いて `NOTIFY_WEBHOOK_URL` に登録し、最初の実行を起動します。認証情報の中身は画面に出ません。`python scripts/setup.py doctor` は確認だけをして何も変えません。
-5. **聴く** — 数分で、今日の記事一覧と各ノートブックへのリンク付きの通知が届き、[NotebookLM](https://notebooklm.google.com) の中で 20 分ほどかけて音声ができます。初回は既読状態の初期化として各フィード最新 1 件だけを処理し、過去分は既読になります(洪水は起きません)。1 週間ほど経って 🧹 の削除対象リストが古いラジオだけなら、`cleanup.dry_run: false` にしてください。
+   これで `notebooklm` CLI のインストール、ブラウザでの Google ログイン、`NOTEBOOKLM_AUTH_JSON` シークレットの登録、Slack / Discord の webhook URL の登録(`NOTIFY_WEBHOOK_URL`)、初回実行までが一気に済みます。ログインは CI 専用の `ci` プロファイルに保存されます。普段使いのプロファイルと分けないとセッションが 3 日ほどで切れてしまうためで、詳しくは [docs/OPERATIONS.md](docs/OPERATIONS.md) に書いてあります。認証情報の中身が画面に出ることはありません。確認だけしたいときは `python scripts/setup.py doctor` を使ってください。
+5. 数分すると、今日の記事一覧とノートブックへのリンクが通知で届きます。音声は [NotebookLM](https://notebooklm.google.com) 側で 20 分ほどかけて作られます。初回は各フィードの最新 1 件だけを処理して、それより古い記事は既読扱いにするので、過去記事が一気に流れ込むことはありません。1 週間ほど経つと 🧹 付きで削除対象の一覧が通知されるので、古いラジオだけが挙がっていることを確かめてから `cleanup.dry_run: false` にしてください。
 
-セットアップはこれで全部です。以後は勝手に回ります。`state.json` は bot が作ってコミットします — 手で編集しないでください。約 3.5 週間ごとに Google のセッションが切れ、エラー通知が届きます。直し方は `python scripts/setup.py renew`(2 分ほど)です。
+あとは放っておけば毎日回ります。`state.json` は bot が管理するので手で触らないでください。3.5 週間ほどで Google のセッションが切れてエラー通知が来たら、`python scripts/setup.py renew` を実行すれば 2 分ほどで復旧します。
 
 ## 設定リファレンス
 
-すべて `config.yaml` にあります(インラインの注釈つき):
+設定は `config.yaml` の 1 ファイルにまとまっていて、コメントも書いてあります。
 
 | キー | 何をするか |
 |---|---|
-| `feeds[].topic` | トピックごとに 1 日 1 ノートブック + 1 ラジオ。無関係な話題を混ぜると番組が散らかるので分ける。 |
-| `feeds[].type: sitemap` | RSS の無いサイト向け。`sitemap.xml` を読み、`prefix` 配下の URL を記事として扱う。 |
-| `feeds[].source_mode: text` | ボット対策で NotebookLM のフェッチャーが弾かれるホスト向け。URL の代わりに RSS の要約をテキスト投入し、「要約のみ」と明示する。 |
-| `feeds[].mode: latest` | アグリゲータなど流量の多いフィード向け。毎回最新 N 件だけ拾い、残りは意図的に既読にする(既定の backlog は古い順に消化して何も捨てない)。 |
-| `topics.<name>.audio` | トピック別の音声設定の上書き — `format`(deep-dive / brief / critique / debate)、`length`、`prompt`、`language`。 |
-| `settings.notebook_title_format` | 自動削除はこの形式に**完全一致**するタイトルだけが対象。手動で作ったノートブックには構造的に触れない。 |
-| `settings.timezone` | ノートブックの日付と月次判定の基準。runner は UTC なので必ず自分のものを。 |
-| `settings.limits` | 1 回に処理する記事数。超過分は捨てずに次回へ持ち越し。 |
-| `settings.audio` | 全体の音声設定: `format`、`length`、`prompt`、`scope`(既定 `run`: その回に入れた記事だけで 1 本。`notebook`: その日のノートブック全体)。 |
-| `settings.cleanup` | 古い日次ノートブックの自動削除。`dry_run: true` で出荷 — 削除予定リストが正しいのを確認してから false に。 |
-| `watch:` | 通知だけのページ監視(ラジオ化はしない)。 |
+| `feeds[].topic` | トピックごとに 1 日 1 ノートブック、1 本のラジオになる。関係ない話題を混ぜると番組が散らかるので分ける。 |
+| `feeds[].type: sitemap` | RSS のないサイト向け。`sitemap.xml` を読み、`prefix` 配下の URL を記事として扱う。 |
+| `feeds[].source_mode: text` | ボット対策で NotebookLM の取得が弾かれるホスト向け。URL の代わりに RSS の要約をテキストとして入れ、「要約のみ」と明示する。 |
+| `feeds[].mode: latest` | アグリゲータのように流量の多いフィード向け。毎回最新の N 件だけ拾い、残りは意図的に既読にする。既定の backlog モードは古い順に消化して何も捨てない。 |
+| `topics.<name>.audio` | トピック別に音声設定を上書きする。`format`(deep-dive / brief / critique / debate)、`length`、`prompt`、`language`。 |
+| `settings.notebook_title_format` | 自動削除の対象は、この形式に完全一致するタイトルだけ。手で作ったノートブックには触らない。 |
+| `settings.timezone` | ノートブックの日付と月次判定の基準。runner は UTC なので必ず自分のタイムゾーンを入れる。 |
+| `settings.limits` | 1 回に処理する記事数。超えた分は捨てずに次回へ持ち越す。 |
+| `settings.audio` | 全体の音声設定。`format`、`length`、`prompt`、`scope`(既定の `run` はその回に入れた記事だけで 1 本。`notebook` にするとその日のノートブック全体)。 |
+| `settings.cleanup` | 古い日次ノートブックの自動削除。初期状態は `dry_run: true` で、削除予定の一覧が正しいことを確かめてから false にする。 |
+| `watch:` | 通知だけのページ監視。ラジオにはしない。 |
 
-編集した設定は何も実行せずに検査できます: `python radio_batch.py --check-config`。`config.yaml` を読むだけで、ネットワークにも NotebookLM にも触れません。CI も毎回 batch の前に同じ検査を走らせるので、typo(`feeds:` を `feed:`、フィード内に `topics:`)は既定値に黙って落ちず、読めるメッセージで止まります。設定の全体像は [`config.schema.json`](config.schema.json) にあります。
+設定を変えたら `python radio_batch.py --check-config` で検査できます。`config.yaml` を読むだけで、ネットワークにも NotebookLM にもアクセスしません。CI でも毎回 batch の前に同じ検査を通すので、`feeds:` を `feed:` と書いてしまったような typo は、既定値で黙って動くのではなくエラーで止まります。使えるキーの一覧は [config.schema.json](config.schema.json) にあります。
 
-## 運用
+## 運用で知っておくこと
 
-- **認証は約 3.5 週間で切れます。** 原因を名指しするエラー通知が届くので、手順 2 と手順 3 の 1 行目をやり直せば復旧します。手順書: [docs/OPERATIONS.md](docs/OPERATIONS.md)。
-- **沈黙は故障です。** 新着ゼロの日も 😪 の通知が来ます。何も来なければ Actions タブを確認。
-- **音声生成は fire-and-forget。** 通知は「生成を開始した」であり、Google 側でレンダリングが失敗しても実行は失敗になりません。生成の*開始*自体に失敗した場合（多くは NotebookLM の 1 日あたりの音声生成上限。無料枠は 3 本）は、記事はノートブックに入った状態で、原因を添えた別のエラー通知が届きます。アプリから手動で生成してください。
-- **Private リポジトリの Actions 無料枠:** 1 日 2 回なら余裕で収まります(実行は通常数分。30 分はワーストケースのタイムアウト)が、使用量には気を配ってください。
+認証は 3.5 週間ほどで切れます。切れると原因を書いたエラー通知が届くので、`python scripts/setup.py renew` を実行してください。詳しい手順は [docs/OPERATIONS.md](docs/OPERATIONS.md) にあります。
 
-## 設計ノート
+新着がない日でも 😪 の通知は届くようにしてあります。通知が何も来ない日があったら、それは故障です。Actions タブを見てください。
 
-エンジニアリング的に面白いのは既読管理です。RSS フィードは **watermark**(最後に処理した記事の公開時刻)、sitemap フィードは **既読 URL 集合**を使っており、どちらの方式も相手のフィード型に使うと実際の事故につながります。その顛末、ボット対策ページの検出、そしてこのプロジェクトが**あえてやらないこと**(User-Agent 偽装、プラグインシステム化)は [docs/DESIGN.md](docs/DESIGN.md) にあります。
+音声の生成は「開始した」時点で成功扱いです。Google 側でレンダリングに失敗しても、実行は失敗になりません。生成の開始そのものに失敗したとき(ほとんどは NotebookLM の 1 日あたりの生成上限で、無料枠は 3 本です)は、記事はノートブックに入った状態のまま、原因を添えたエラー通知が別に届きます。その場合はアプリから手動で生成してください。
+
+Private リポジトリの GitHub Actions の無料枠は、1 日 2 回の実行なら十分に収まります。1 回は数分で終わり、タイムアウトの 30 分は最悪の場合の値です。
+
+## 設計について
+
+いちばん手間がかかったのは既読管理です。RSS フィードは最後に処理した記事の公開時刻(watermark)で管理し、sitemap フィードは既読 URL の集合で管理しています。どちらも逆の方式を使うと実際に事故になります。その経緯や、ボット対策ページの検出、User-Agent の偽装やプラグイン化など「あえてやらないこと」は [docs/DESIGN.md](docs/DESIGN.md) にまとめました。
 
 ## サポート
 
-ベストエフォートです。issue も PR も歓迎ですが、これは「たまたま共有できる形にした、ひとりの朝のラジオ」です — 誠実な返答はしますが SLA はありません。NotebookLM 側が変われば、notebooklm-py が追従するまで止まります。
+個人プロジェクトなので、対応はできる範囲で行います。issue や PR は歓迎しますが、SLA のようなものはありません。NotebookLM 側に変更があると、notebooklm-py が追従するまで止まります。
 
 ## クレジットとライセンス
 
-- Powered by [notebooklm-py](https://github.com/teng-lin/notebooklm-py) (MIT) by Teng Lin — このプロジェクトが呼び出している非公式 NotebookLM CLI です。ここにあるものは何ひとつ、これ無しでは動きません。スターを送りましょう。
-- ライセンス: [MIT](LICENSE)
+NotebookLM の操作には Teng Lin さんの [notebooklm-py](https://github.com/teng-lin/notebooklm-py)(MIT)を使っています。このプロジェクトは丸ごとこれに依存しています。
+
+ライセンスは [MIT](LICENSE) です。
