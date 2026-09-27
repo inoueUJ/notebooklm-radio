@@ -2,6 +2,8 @@
 
 [日本語](GUIDE.ja.md)
 
+> 📸 **Step-by-step page with screenshots: [https://inoueuj.github.io/tech-feed-catalog/guide/](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)** — the same flow in ten steps, with the places to click marked on real screenshots. This Markdown is the same content as one file, handy for searching the notification text.
+
 One document from first setup to daily use to troubleshooting. Design rationale lives in [DESIGN.md](DESIGN.md); operational detail and the incident log in [OPERATIONS.md](OPERATIONS.md). This guide only points there.
 
 ## Contents
@@ -63,7 +65,7 @@ It opens in a guided mode with four steps.
 
 **4. Done.** The complete `config.yaml` and the two schedule lines already converted to UTC (GitHub's cron only speaks UTC). **Download** the file and copy the cron lines. **Share link** copies a URL that restores the whole setup; the same browser also remembers it across reloads.
 
-The "things to know" panel lists: feeds CI can't fetch, hosts that refuse bots, two feeds that publish the same articles (subscribing to both adds every article twice), summary-only feeds, and volumes your limits can't absorb.
+The "things to know" panel lists: feeds CI can't fetch, hosts that refuse bots, two feeds that publish the same articles (identical URLs are merged once; different URLs for the same article are added twice), summary-only feeds, and volumes your limits can't absorb.
 
 "Browse the list" at the top right switches to the classic view: all 76 catalog feeds, filterable by category and volume, with checkboxes. The selection is shared between the two modes. Use it if you only want an OPML file or a list of feed URLs.
 
@@ -132,11 +134,11 @@ Each run posts something like:
 - "Started", not "finished": NotebookLM renders the audio over the next 10–20 minutes. Turn on the NotebookLM app's notifications to hear when it's done.
 - `要約のみ` marks an article whose page is bot-protected; only the feed's summary went in, and the show knows that.
 - `（音声は未生成）` on a heading means the sources are in but the audio couldn't be started; a separate message says why (usually the daily cap). You can generate it by hand in the app.
-- A quiet run posts `😪 今回は新着なしだったよ`. **Silence is abnormal** ([section 9](#9-when-something-looks-wrong)).
+- A quiet run posts `😪 今回は新着なしだったよ。ラジオはおやすみ〜`. **Silence is abnormal** ([section 9](#9-when-something-looks-wrong)).
 - The second run of a day makes a separate episode from that run's new articles only; the morning's aren't replayed.
 - The very first run processes only the newest article per feed and marks the backlog as read. No flood.
 
-After about a week you'll see `🧹 [ドライラン] 7日より古いラジオ 2件を削除する予定` listing notebooks it would delete. If the list is only old episodes, set `cleanup.dry_run: false` in `config.yaml`. Deletion only ever touches notebooks whose title exactly matches this batch's naming; hand-made notebooks are never candidates.
+After about a week you'll see `🧹 [ドライラン] 7日より古いラジオ 2件が削除対象だよ（まだ消してない）` listing notebooks it would delete. If the list is only old episodes, set `cleanup.dry_run: false` in `config.yaml`. Deletion only ever touches notebooks whose title exactly matches this batch's naming; hand-made notebooks are never candidates.
 
 ## 7. Changing things
 
@@ -186,12 +188,12 @@ Rules:
 | Nothing for days | The notification path itself is down | Check the last run in the Actions tab; check `NOTIFY_WEBHOOK_URL` with `doctor` |
 | `🚨 テスト/lint が失敗した…` | The code checks failed; no episode was made | Open the linked run. A config problem is printed there |
 | `Tech Radio 実行エラー発生` + `Authentication expired` | Credential expired | `python scripts/setup.py renew` |
-| `Tech Radio 実行エラー発生` + `ConfigError` | Bad config.yaml | Fix the listed items; `--check-config` |
+| `🚨 テスト/lint が失敗した` | Tests, lint or the config check failed (a bad config.yaml stops here, before the batch) | Open the linked run; it shows `config.yaml NG` and why. `--check-config` reproduces it locally |
 | `（音声は未生成）` + a message with `rate_limited` | Daily Audio Overview cap | Fewer notebooks, drop the second run, or a bigger plan. Sources are in the notebook; generate by hand if you like |
 | `⚠️ RSSフィードの取得に問題があるよ ・X: HTTP 403` | That feed couldn't be fetched; its read-state was left alone | Transient: ignore. Persistent 403: the host refuses bots |
 | `⚠️ 以下はサイトのボット対策で本文を取り込めなかった` | Article pages were challenge pages | Add `source_mode: text` to that feed |
 | `😪 今回は新着なし` every time | Genuinely quiet, or `feeds:` is empty | `--check-config` prints the feed count |
-| The same article twice | Two feeds publish the same articles (Vercel blog + atom) | Drop one; the builder warns about this |
+| The same article twice | Two feeds carry the same article under different URLs (identical URLs are merged automatically; Vercel blog + atom is that case) | Drop one; the builder warns about this |
 | Only old articles | Volume exceeds the per-feed limit and the backlog drains oldest-first | `mode: latest` on that feed, or raise `limits.per_feed` |
 | No audio appears in the notebook | Generation started but failed on Google's side | Regenerate in the app; if it repeats, suspect the cap or the content |
 | The evening episode landed in tomorrow's notebook | GitHub started the run hours late and it crossed midnight | Move the cron earlier; avoid :00 and :30, which are the most congested |

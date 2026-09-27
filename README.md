@@ -8,6 +8,8 @@ notebooklm-radio polls the RSS feeds and sitemaps you care about, and every morn
 
 Built for one concrete itch: *English tech articles pile up faster than you can read them, but your commute has 40 free minutes of ears.* Japanese-first by default (the author listens in Japanese), works in any language NotebookLM supports.
 
+**→ [Setup guide with screenshots](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)** — ten steps from picking feeds to your first episode, plus what to do every morning and every 3.5 weeks. [日本語版](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja). Feeds come from **[tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog)** ([builder](https://inoueuj.github.io/tech-feed-catalog/) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json)).
+
 ## ⚠️ Read this before using
 
 - This project drives NotebookLM through [notebooklm-py](https://github.com/teng-lin/notebooklm-py), an **unofficial, reverse-engineered client**. Google can change or break NotebookLM at any time, without notice, and this whole pipeline with it.
@@ -35,36 +37,32 @@ Details that took real incidents to get right (1,226 falsely-new articles, a 16-
 
 | You want to… | Read |
 |---|---|
+| Set it up step by step, with screenshots | **[The setup guide](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)** (web page, English / [日本語](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=ja)) |
 | Get running in five minutes | The quick start below |
-| Understand the whole thing, change settings, read the notifications, fix a problem | **[docs/GUIDE.md](docs/GUIDE.md)** (the user guide, start to finish) |
+| Read the same guide as one Markdown file (grep-able), change settings, read the notifications, fix a problem | [docs/GUIDE.md](docs/GUIDE.md) |
 | Pick feeds and generate a config | [The config builder](https://inoueuj.github.io/tech-feed-catalog/) |
+| Browse the validated feed catalog (70+ developer feeds, checked weekly) | [tech-feed-catalog](https://github.com/inoueUJ/tech-feed-catalog) · [feeds.json](https://inoueuj.github.io/tech-feed-catalog/feeds.json) |
 | Know every key config.yaml accepts | [config.schema.json](config.schema.json) |
 | Know why it is built this way | [docs/DESIGN.md](docs/DESIGN.md) |
 | Renew the credential, read the incident log | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
 
 ## Quick start
 
-You need: a GitHub account, a Google account with NotebookLM access, a Slack or Discord webhook (step 4 tells you where to get one), and a machine with a browser for the one-time login. Locally you need [uv](https://docs.astral.sh/uv/getting-started/installation/) and the [GitHub CLI](https://cli.github.com/) (`gh auth login` once); the wizard in step 4 checks for both and tells you what's missing.
+The full walkthrough with screenshots is **[the setup guide](https://inoueuj.github.io/tech-feed-catalog/guide/?lang=en)**. The short version:
 
-**1. Build your config first** — open **[the config builder](https://inoueuj.github.io/tech-feed-catalog/)**. Tick feeds from the catalog or add your own (a Zenn topic, a Qiita tag, any feed URL — checked live), group them into notebooks, pick a conversation style per notebook, set your language, timezone and run times, then **Download** `config.yaml` and copy the two cron lines from the *cron* tab. The page also warns you about the things that bite later: your NotebookLM plan's daily Audio Overview quota vs. notebooks × runs, feeds that publish more than you can process, two feeds carrying the same articles, bot-blocked hosts. Doing this *before* creating the repo means the very first episode is already yours.
+1. **Build your config** in [the builder](https://inoueuj.github.io/tech-feed-catalog/): tap the feeds you follow (or add a Zenn topic, a Qiita tag, any feed URL), group them into shows, choose when to listen, then download `config.yaml` and copy the two cron lines. The page warns about the daily Audio Overview quota vs. shows × runs, firehose feeds, duplicate feeds and bot-blocked hosts before they bite.
+2. **Use this template → Create a new repository**, **Private** (the bot commits your read-state to `state.json`), then clone it.
+3. **Drop the config in**: replace `config.yaml` with the downloaded file and the two `- cron:` lines in `.github/workflows/rss-radio.yml` with the builder's, check it with `python radio_batch.py --check-config` (reads the file, runs nothing), and push.
+4. **Run the wizard once** on your PC (needs Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/) and the [GitHub CLI](https://cli.github.com/) after `gh auth login`; the wizard tells you what is missing):
 
-**2. Create your copy** — click **Use this template → Create a new repository**. Choose **Private** (the bot commits your reading history into `state.json`). Clone it.
+   ```bash
+   python scripts/setup.py
+   ```
 
-**3. Put your config in** — replace `config.yaml` with the downloaded file, and the two `- cron:` lines in `.github/workflows/rss-radio.yml` with the ones from the *cron* tab. (Hand-editing works too; `python radio_batch.py --check-config` validates the file without running anything.)
+   It installs the pinned `notebooklm` CLI, opens a browser for a Google login into a CI-only `ci` profile (kept apart from your everyday profile, which stretches the credential's life from ~3 days to ~3.5 weeks — see [docs/OPERATIONS.md](docs/OPERATIONS.md)), stores that session as the `NOTEBOOKLM_AUTH_JSON` secret, asks for your Slack or Discord webhook URL and stores it as `NOTIFY_WEBHOOK_URL`, and starts the first run. Nothing about the credential is printed. `python scripts/setup.py doctor` runs the checks only.
+5. **Listen.** Within minutes a notification lists today's articles with a link to each notebook; the audio is ready in [NotebookLM](https://notebooklm.google.com) about 20 minutes later. The first run processes only the newest article per feed and marks the backlog read (no flood). After about a week, when the 🧹 dry-run message lists only old episodes, set `cleanup.dry_run: false`.
 
-**4. Run the setup wizard** in the clone:
-
-```bash
-python scripts/setup.py
-```
-
-It installs the pinned `notebooklm` CLI with uv, opens a browser for the Google login into a dedicated `ci` profile (kept separate from your everyday one, which is what extends the credential's life from ~3 days to ~3.5 weeks — see [docs/OPERATIONS.md](docs/OPERATIONS.md)), stores the session as the `NOTEBOOKLM_AUTH_JSON` secret, asks for your webhook URL and stores it as `NOTIFY_WEBHOOK_URL`, and triggers the first run. Nothing is typed into a shell redirect, so it works in PowerShell too, and the credential's contents never appear on screen. `python scripts/setup.py doctor` shows the same checks without changing anything.
-
-Where the webhook comes from: **Slack** — [api.slack.com/apps](https://api.slack.com/apps) → Create New App → Incoming Webhooks → Activate → Add New Webhook to Workspace → pick a channel → copy the URL. **Discord** — channel settings → Integrations → Webhooks → New Webhook → Copy Webhook URL. Both are auto-detected from the URL.
-
-**5. Listen** — within a few minutes you get a webhook message listing today's articles with a link to each notebook, and the audio renders inside [NotebookLM](https://notebooklm.google.com) over the next ~20 minutes. The first run initializes read-state: it processes only the latest article per feed and marks the backlog as read (no flood). After a week, look at the 🧹 would-delete list in your notifications and, if it's right, set `cleanup.dry_run: false`.
-
-That's the whole setup. From now on it runs by itself; `state.json` is created and committed by the bot — never edit it by hand. Every ~3.5 weeks the Google session expires and an error message tells you so; the fix is `python scripts/setup.py renew` (about two minutes).
+That is the whole setup; from here on it runs by itself. `state.json` is written and committed by the bot — never edit it by hand. Every ~3.5 weeks the Google session expires and the error notification says so; the fix is `python scripts/setup.py renew` (two minutes).
 
 ## Configuration reference
 
