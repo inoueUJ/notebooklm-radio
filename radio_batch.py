@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
-from urllib.parse import urldefrag
+from urllib.parse import urldefrag, urlparse
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
@@ -1167,6 +1167,23 @@ def read_feed_state(state, url):
     return None, None, []
 
 
+def host_covered_until(state, url, own_key):
+    """同じホストの別 RSS フィードが処理済みの範囲（その透かしの最大値）。無ければ None。
+
+    全体版のフィードを狭いフィードに置き換えると、新しいフィードは初回扱いになり最新 1 件を処理する。
+    その 1 件は置き換え前のフィードで放送済みのことが多い（2026-09-29 の置き換えで 4 件が再放送
+    される計算だった）。同じホストで既に通った時刻より古ければ、初回の 1 件は流さない。
+    """
+    host = urlparse(url).netloc
+    marks = []
+    for key, raw in state.items():
+        if key == own_key or key.startswith(('sitemap:', 'watch:')) or not isinstance(raw, dict):
+            continue
+        if raw.get('watermark') and urlparse(key).netloc == host:
+            marks.append(datetime.datetime.fromisoformat(raw['watermark']))
+    return max(marks) if marks else None
+
+
 def read_threshold(watermark, floor):
     """この時刻以降の記事は「処理済み ID に無ければ未読」。None は初回（全件が未読）。"""
     if watermark is None:
@@ -1313,7 +1330,16 @@ def check_rss_feeds(config, state):
         elif first_run:
             # 初回は最新1件だけ処理し、残りは既読にする（過去記事の洪水を防ぐ）
             picked = unread[-1:]
-            print(f"[{name}] First run: marking all {len(entries)} entries as read, processing the latest one.")
+            covered = host_covered_until(state, url, key)
+            if picked and covered and picked[0]['ts'] and picked[0]['ts'] <= covered:
+                # 同じホストの別フィード（置き換え前の全体版など）がこの時刻までを処理済み。
+                # 最新 1 件も放送済みの可能性が高いので、初回は既読化だけにする
+                picked = []
+                print(
+                    f"[{name}] First run: marking all {len(entries)} entries as read (already covered by a feed on this host)."
+                )
+            else:
+                print(f"[{name}] First run: marking all {len(entries)} entries as read, processing the latest one.")
         elif latest_mode:
             # アグリゲータ向け（mode: latest）: 古い順に消化せず「最新 N 件」だけ拾い、残りの未読は
             # 意図的に既読にする。「処理していない記事を既読にしない」ルールのフィード単位の例外で、

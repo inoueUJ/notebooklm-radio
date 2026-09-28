@@ -186,6 +186,32 @@ def feed_of(*pairs):
     return FakeFeed(entries)
 
 
+def test_replacement_feed_does_not_replay_what_its_host_already_covered(feed_box):
+    """全体版を同じホストの狭いフィードに置き換えたとき、初回の 1 件で放送済みの記事を流さない。
+
+    2026-09-29: Cloudflare Changelog / GitHub / Google Cloud を狭いフィードに置き換えると、
+    初回の最新 1 件が 4 本とも数日前に放送済みの記事だった。
+    """
+    narrow = {'feeds': [{'name': 'Narrow', 'url': 'https://example.com/feed/label/actions'}]}
+    state = {'https://example.com/feed': {'watermark': (BASE + DAY).isoformat(), 'recent_ids': []}}
+
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY))  # 最新も旧フィードの透かし以前
+    assert run_once(state, feed_box, narrow)[0] == []
+    assert 'https://example.com/feed/label/actions' in state  # 既読化はされている
+
+    # 以後は普通に新着を拾う
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY), (3, BASE + 2 * DAY))
+    assert run_once(state, feed_box, narrow)[0] == ['記事3']
+
+
+def test_new_feed_on_known_host_still_airs_a_newer_latest(feed_box):
+    """同じホストでも、旧フィードの透かしより新しい最新記事は初回に流す（Claude Code の changelog）。"""
+    config = {'feeds': [{'name': 'Changelog', 'url': 'https://example.com/changelog/rss.xml'}]}
+    state = {'https://example.com/whats-new/rss.xml': {'watermark': BASE.isoformat(), 'recent_ids': []}}
+    feed_box['feed'] = feed_of((1, BASE - DAY), (2, BASE + DAY))
+    assert run_once(state, feed_box, config)[0] == ['記事2']
+
+
 def test_backdated_late_entry_is_detected(feed_box):
     """透かしより前の日付で後から差し込まれた記事も拾う。
 
