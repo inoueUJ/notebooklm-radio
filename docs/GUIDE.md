@@ -153,9 +153,11 @@ Everything is in `config.yaml`. Commit and push; the next run picks it up (a pus
 | Run times | The two `- cron:` lines in `.github/workflows/rss-radio.yml` (UTC); the builder's `cron` tab converts |
 | Articles per run | `settings.limits.per_feed` (default 3) and `total` (default 15). Overflow carries over, never dropped |
 | A firehose feed | `mode: latest` on that feed |
+| A feed that mixes in off-topic posts | `categories: [...]` on that feed (keeps items tagged with those RSS categories) |
 | Audio language | `settings.language` |
 | How long notebooks live | `settings.cleanup.retention_days` |
 | A host that blocks fetchers | `source_mode: text` on that feed |
+| A changelog whose links are `#anchors` on one page | `source_mode: text` on that feed (by URL, the whole page comes in every time) |
 
 Validate with `python radio_batch.py --check-config`. Every accepted key is in [`config.schema.json`](../config.schema.json); unknown keys are errors on purpose.
 
@@ -192,6 +194,7 @@ Rules:
 | `（音声は未生成）` + a message with `rate_limited` | Daily Audio Overview cap | Fewer notebooks, drop the second run, or a bigger plan. Sources are in the notebook; generate by hand if you like |
 | `⚠️ RSSフィードの取得に問題があるよ ・X: HTTP 403` | That feed couldn't be fetched; its read-state was left alone | Transient: ignore. Persistent 403: the host refuses bots |
 | `⚠️ 以下はサイトのボット対策で本文を取り込めなかった` | Article pages were challenge pages | Add `source_mode: text` to that feed |
+| The same page several times in one notebook (e.g. three copies of "… changelog") | The feed links to `#anchors` on one page, and NotebookLM imports the whole page per entry | Add `source_mode: text` to that feed |
 | `😪 今回は新着なし` every time | Genuinely quiet, or `feeds:` is empty | `--check-config` prints the feed count |
 | The same article twice | Two feeds carry the same article under different URLs (identical URLs are merged automatically; Vercel blog + atom is that case) | Drop one; the builder warns about this |
 | Only old articles | Volume exceeds the per-feed limit and the backlog drains oldest-first | `mode: latest` on that feed, or raise `limits.per_feed` |

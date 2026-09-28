@@ -72,7 +72,8 @@ Everything lives in `config.yaml` (annotated inline):
 |---|---|
 | `feeds[].topic` | One notebook + one radio per topic per day. Mixing unrelated topics makes the show incoherent — split them. |
 | `feeds[].type: sitemap` | For sites with no RSS: reads `sitemap.xml`, treats URLs under `prefix` as articles. |
-| `feeds[].source_mode: text` | For hosts that block NotebookLM's fetcher with a bot challenge: submits the RSS summary as text instead of the URL, clearly labeled as summary-only. |
+| `feeds[].source_mode: text` | For feeds whose article URL doesn't give NotebookLM the article: hosts that answer its fetcher with a bot challenge, and changelogs whose links are `#anchors` on one long page (by URL, NotebookLM imports the whole page for every entry). Submits the feed's own text instead of the URL: the full body when the feed carries one, otherwise the summary, clearly labeled as summary-only. |
+| `feeds[].categories` | Keep only items tagged with one of these RSS categories (case-insensitive), e.g. `[Product, Research]` for a feed that mixes launches with company news and customer stories. Ignored for sitemaps. |
 | `feeds[].mode: latest` | For aggregators and other firehoses: each run takes only the newest N and deliberately marks the rest read, instead of draining a backlog oldest-first. |
 | `topics.<name>.audio` | Per-topic Audio Overview overrides — `format` (deep-dive / brief / critique / debate), `length`, `prompt`, `language`. |
 | `settings.notebook_title_format` | Cleanup only deletes notebooks whose title **fully matches** this — your manual notebooks are structurally safe. |

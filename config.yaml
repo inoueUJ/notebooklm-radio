@@ -8,7 +8,8 @@
 #                One notebook + one audio overview per topic per day; mixing unrelated
 #                topics in one radio makes the conversation incoherent, so split them.
 #   type:        "sitemap" for sites that publish no RSS feed (see the commented example)
-#   source_mode: "text" for hosts whose article pages block NotebookLM's fetcher
+#   source_mode: "text" when the article URL doesn't give NotebookLM the article: hosts whose
+#                pages block its fetcher, and changelogs linking to #anchors on one long page
 #   mode:        "latest" for aggregators/firehoses: take only the newest N per run and
 #                deliberately mark the rest read, instead of draining a backlog oldest-first
 #                (the default, "backlog", never drops anything). See the commented example.
@@ -22,9 +23,13 @@ feeds:
   - name: "Cloudflare"
     url: "https://blog.cloudflare.com/rss/"
     topic: "Infra"
+  # A changelog whose items all link to #anchors on one long page. By URL, NotebookLM
+  # would import the whole history for every version; `source_mode: text` submits each
+  # item's own text instead (this feed carries every version's full release notes).
   - name: "Claude Code"
-    url: "https://code.claude.com/docs/en/whats-new/rss.xml"
+    url: "https://code.claude.com/docs/en/changelog/rss.xml"
     topic: "AI"
+    source_mode: text
 
   # A site with no RSS feed: point at its sitemap.xml and pick a URL prefix.
   # Read-state for sitemaps uses a seen-URL set, not a watermark — editing an old
@@ -38,10 +43,13 @@ feeds:
 
   # A host whose article pages return a bot challenge (e.g. Cloudflare's
   # "Just a moment...") to non-browser clients. NotebookLM's fetcher would store the
-  # challenge page instead of the article. `source_mode: text` submits the RSS
-  # title + summary as a text source instead of the URL, bypassing the fetcher.
-  # The radio then only knows the summary — the source text says so explicitly,
-  # and notifications mark these articles as summary-only.
+  # challenge page instead of the article. `source_mode: text` submits the feed
+  # item's text as a text source instead of the URL, bypassing the fetcher.
+  # This feed carries only a summary, so the radio only knows the summary — the
+  # source text says so explicitly, and notifications mark these articles as summary-only.
+  # (The same switch fixes changelogs whose links are #anchors on one long page:
+  # by URL NotebookLM would import the whole page for every entry. Their feeds carry
+  # each entry's full text, and the source is labeled as such.)
   # Deliberately NOT worked around by spoofing a browser User-Agent: that would be
   # evading someone else's bot protection. This project settles for less content.
   # - name: "OpenAI"

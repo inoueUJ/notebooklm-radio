@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
+from urllib.parse import urldefrag
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
@@ -31,15 +32,26 @@ MAX_ARTICLES_PER_FEED = 3
 # 1回の実行で処理する記事数の全体上限（settings.limits.total で上書き可）。
 # 記事ごとに source wait が直列で走るため、上げすぎると30分タイムアウトを圧迫する。
 MAX_ARTICLES_TOTAL = 15
-# 透かしと同時刻のエントリを識別するために保持するID数
+# 処理済みとして覚えておく ID の数（透かしだけでは既読を判定できない記事の分は、これを超えても消さない）
 MAX_RECENT_IDS = 200
+# 透かしより前の日付で「後から」差し込まれる記事を拾うための振り返り幅。
+# フィードは公開順に並ぶとは限らず、前日付の記事が数時間〜数日遅れて現れる
+# （2026-09 の実測: OpenAI・Cloudflare Changelog・Vercel・GitHub で 7 日間に 14 件。
+# 遅れは最大 2 日強）。透かしだけだと、現れた時点で既読扱いになり一度も放送されない。
+LOOKBACK = datetime.timedelta(days=7)
+# sitemap の記事はフィードから押し出されない（毎回全 URL が返る）。全体上限の並べ替えで最後に回す
+NEVER_SCROLLS_OUT = 10**9
 # feed に topic が指定されていない場合の行き先ノートブック（settings.default_topic で上書き可）
 DEFAULT_TOPIC = 'AI'
 
 # feed の source_mode。既定は 'url'（記事URLを渡して NotebookLM に取得させる）。
 # 'text' は記事URLを渡さず、RSSの配信内容をこちら側でMarkdown化して投入するモード。
-# openai.com のように Cloudflare のボット判定で記事ページが 403 (cf-mitigated: challenge)
-# を返すホスト向け。相手側の判定なのでリトライでは通らず、フェッチャーを迂回するしかない。
+# 記事URLをそのまま渡すと中身が正しく入らないフィード向けで、理由は2種類ある:
+# - openai.com のように Cloudflare のボット判定で記事ページが 403 (cf-mitigated: challenge)
+#   を返すホスト。相手側の判定なのでリトライでは通らず、フェッチャーを迂回するしかない。
+# - 変更履歴の RSS のように、リンクが 1 枚の長いページの #アンカーになっているフィード。
+#   NotebookLM は # 以降を無視してページ全体を取り込むので、1 項目のつもりが全履歴になり、
+#   同じページが項目数だけ重複して入る（Codex changelog で 1 冊に 3 重）。
 TEXT_SOURCE_MODE = 'text'
 
 # ボット対策ページを掴まされたソースのタイトル (Cloudflare "Just a moment..." 等)。
@@ -85,7 +97,7 @@ class ConfigError(ValueError):
 
 # config.yaml で受け付けるキー。config.schema.json（ビルダー用の型定義）と同じ規則。
 TOP_KEYS = {'feeds', 'topics', 'watch', 'settings'}
-FEED_KEYS = {'name', 'url', 'type', 'prefix', 'topic', 'source_mode', 'mode'}
+FEED_KEYS = {'name', 'url', 'type', 'prefix', 'topic', 'source_mode', 'mode', 'categories'}
 TOPIC_KEYS = {'audio'}
 WATCH_KEYS = {'name', 'url', 'prefix', 'keywords'}
 SETTINGS_KEYS = {
@@ -185,6 +197,12 @@ def validate_config(config):
             errors.append(f"{where}: `mode` は {sorted(FEED_MODES)} のいずれか（実際: {mode!r}）")
         elif mode == 'latest' and ftype == 'sitemap':
             warnings.append(f"{where}: `mode: latest` は sitemap 型では無視される（seen-set は毎回全件を見る）")
+        if 'categories' in feed:
+            cats = feed['categories']
+            if not isinstance(cats, list) or not cats or not all(isinstance(c, str) and c.strip() for c in cats):
+                errors.append(f"{where}: `categories` は RSS のカテゴリ名（文字列）のリスト")
+            elif ftype == 'sitemap':
+                warnings.append(f"{where}: `categories` は sitemap 型では無視される（sitemap にカテゴリは無い）")
         if isinstance(feed.get('url'), str):
             key = f"sitemap:{feed['url']}:{feed.get('prefix')}" if ftype == 'sitemap' else feed['url']
             if key in seen_keys:
@@ -436,28 +454,53 @@ def entry_summary(entry):
     return strip_html(raw)
 
 
+def entry_categories(entry):
+    """RSS の <category> / Atom の <category term> を小文字の集合で返す。"""
+    return {(tag.get('term') or '').strip().lower() for tag in getattr(entry, 'tags', None) or []} - {''}
+
+
+def entry_has_content(entry, link):
+    """フィードの配信テキストが記事の本文そのものか（要約ではないか）。
+
+    - content:encoded / Atom <content> がある → 本文を配信している
+    - リンクが #アンカー → 1 ページに全項目が並ぶ変更履歴で、項目のテキストがその項目の全部
+      （Claude Platform のリリースノートは description に 1 日分の全文を入れている）
+    記事ページが別にあって description / <summary> だけのフィード（OpenAI、中央値 149 字）は
+    要約なので False。長さでは決めない: OpenAI の要約は最長 683 字、リリースノートの全文は
+    短い日で 100 字足らずと重なっている。
+    テキスト投入時の但し書き（「本文」か「要約のみ」か）をこれで切り替える。
+    """
+    contents = getattr(entry, 'content', None)
+    if contents and strip_html(contents[0].get('value') or ''):
+        return True
+    return bool(urldefrag(link).fragment)
+
+
 def build_text_source(article):
     """記事URLの代わりに投入するテキストソースをMarkdownで組み立てる。
 
-    NotebookLM のフェッチャーを通らないのでボット判定に引っかからない。ただし中身は
-    RSSが配信している範囲であって記事の全文とは限らない。ラジオが「全文を読んだ」前提で
-    語ると誤情報になるので、その但し書きを本文の先頭に必ず入れる。
+    NotebookLM のフェッチャーを通らないのでボット判定に引っかからず、#アンカーのリンクで
+    ページ全体を取り込むこともない。ただし中身はRSSが配信している範囲であって、記事の全文とは
+    限らない。ラジオが「全文を読んだ」前提で語ると誤情報になるので、何が入っているか
+    （本文か、要約だけか、タイトルだけか）を本文の先頭に必ず書く。
     """
     summary = article.get('summary') or ''
     ts = article.get('ts')
     published = ts.astimezone(LOCAL_TZ).strftime('%Y-%m-%d') if ts else '不明'
+    reason = '記事ページをURLのまま取り込むと中身が正しく入らない配信元のため、'
 
-    if summary:
+    if summary and article.get('has_content'):
+        # 変更履歴のRSS（1項目の全文が content:encoded に入っている）など
         note = (
-            '配信元サイトのボット対策により記事本文を取得できないため、'
-            '公式RSSが配信している要約文のみを収録しています。**記事の全文ではありません。**'
+            f'{reason}公式フィードが配信している本文をそのまま収録しています。'
+            'フィードの本文が記事ページの全文と同じとは限りません。'
         )
+        body = f"## 配信されている本文（フィード原文のまま）\n\n{summary}"
+    elif summary:
+        note = f'{reason}公式RSSが配信している要約文のみを収録しています。**記事の全文ではありません。**'
         body = f"## 配信されている要約（RSS原文のまま）\n\n{summary}"
     else:
-        note = (
-            '配信元サイトのボット対策により記事本文を取得できず、RSSにも要約文がないため、'
-            '**タイトルと公開日しか判明していません。**'
-        )
+        note = f'{reason}RSSにも要約文がなく、**タイトルと公開日しか判明していません。**'
         body = '## 本文\n\n（RSSに要約文が含まれていないため、タイトル以外の情報はありません）'
 
     return (
@@ -475,14 +518,16 @@ def source_add_args(article, notebook_id):
     """`notebooklm source add` の引数を組み立てる。"""
     if article.get('source_mode') != TEXT_SOURCE_MODE:
         return ['source', 'add', article['link'], '--notebook', notebook_id]
-    # --title=... の形にするのは、記事タイトルが '-' で始まってもオプション扱いされないため
+    # --title=... の形にするのは、記事タイトルが '-' で始まってもオプション扱いされないため。
+    # フィード名を添えるのは、変更履歴の "2.1.283" のようなタイトルだけでは何の話か分からないから
+    # （URL投入のソースも "記事名 | サイト名" の形になるので揃う）
     return [
         'source',
         'add',
         build_text_source(article),
         '--type',
         'text',
-        f"--title={article['title']}",
+        f"--title={article['title']} | {article['feed_name']}",
         '--notebook',
         notebook_id,
     ]
@@ -639,8 +684,10 @@ def send_notification(webhook_url, new_articles, blocked=None, notebooks=None, n
 
     # 参照元URLも載せる（後から出典を辿れるように）
     def fmt(art):
-        # テキスト投入分はRSSの要約しか入っていない。ラジオの情報量が違うので明示する
-        note = '・要約のみ' if art.get('source_mode') == TEXT_SOURCE_MODE else ''
+        # テキスト投入のうち要約しか入っていない分は、ラジオの情報量が違うので明示する
+        # （本文を配信しているフィードは印を付けない）
+        summary_only = art.get('source_mode') == TEXT_SOURCE_MODE and not art.get('has_content')
+        note = '・要約のみ' if summary_only else ''
         if is_discord:
             return f"・{art['title']}（{art['feed_name']}{note}）\n  {art['link']}"
         return f"・<{art['link']}|{art['title']}>（{art['feed_name']}{note}）"
@@ -976,9 +1023,18 @@ def check_watch_pages(config, state, webhook_url):
 # ---------------------------------------------------------------------------
 # フィードの取得と既読判定
 #
-# 既読判定は「透かし(watermark)」= 前回処理した最新記事の公開時刻 で行う。
-# 「既読IDの一覧」で判定すると、リストを有界にした瞬間に溢れた記事が未読へ戻る。
+# 既読判定の土台は「透かし(watermark)」= 処理した最新記事の公開時刻。
+# 「既読IDの一覧」だけで判定すると、リストを有界にした瞬間に溢れた記事が未読へ戻る。
 # 時刻は単調増加するので、フィードが何件返そうと、IDを何件捨てようと壊れない。
+#
+# ただし透かしだけでは 2 種類の記事を取り違える。
+# - 前日付で後から差し込まれた記事: 透かしより古いので、現れた時点で既読扱いになる。
+#   → 透かしから LOOKBACK だけ遡った範囲は「処理済み ID に無ければ未読」とみなす。
+# - 公開時刻が後から動いた記事（編集で日付が付け直される Vercel、毎週日付が進む定期投稿）:
+#   透かしより新しくなり、放送済みなのに新着扱いになる。
+#   → 処理した記事の ID は必ず recent_ids に残し、ID で既読と分かるものは時刻を見ない。
+# 振り返りの下限 floor は、そのフィードをこの方式で見始めた時点の透かし。移行前に処理した
+# 記事は ID を残していないので、floor より前へは遡らない（遡ると 1 週間分を再放送する）。
 # ---------------------------------------------------------------------------
 
 
@@ -1094,27 +1150,42 @@ def read_sitemap_state(state, key, legacy_url, entries):
 
 
 def read_feed_state(state, url):
-    """(watermark, recent_ids) を返す。未初期化・旧形式(IDのリスト)は初回実行として扱う。"""
+    """(watermark, floor, recent_ids) を返す。未初期化・旧形式(IDのリスト)は初回実行として扱う。
+
+    floor の無い state は振り返り導入前のもの。処理済み記事の ID を同時刻分しか残していないので、
+    floor = 現在の透かしとして、それより前へは遡らない（遡ると処理済みの記事を再放送する）。
+    """
     raw = state.get(url)
     if isinstance(raw, dict):
         watermark = raw.get('watermark')
         parsed = datetime.datetime.fromisoformat(watermark) if watermark else None
-        return parsed, list(raw.get('recent_ids', []))
+        floor = raw.get('floor')
+        parsed_floor = datetime.datetime.fromisoformat(floor) if floor else parsed
+        return parsed, parsed_floor, list(raw.get('recent_ids', []))
     if isinstance(raw, list):
         print(f"Migrating legacy state for {url} (treating as first run).")
-    return None, []
+    return None, None, []
 
 
-def is_unread(entry_id, ts, watermark, recent_ids):
+def read_threshold(watermark, floor):
+    """この時刻以降の記事は「処理済み ID に無ければ未読」。None は初回（全件が未読）。"""
+    if watermark is None:
+        return None
+    lookback = watermark - LOOKBACK
+    return max(lookback, floor) if floor else lookback
+
+
+def is_unread(entry_id, ts, threshold, recent_ids):
+    # 処理済みの ID は、公開時刻が後から動いても既読（Vercel の日付付け直し、定期投稿の再浮上）
     if entry_id in recent_ids:
         return False
-    if watermark is None or ts is None:
+    if threshold is None or ts is None:
         return True
-    # 透かしと同時刻の記事は時刻では区別できない。処理済みなら recent_ids に載っているので、
-    # 載っていなければ未読。日付だけのフィード(Changelog 系)では同じ日の記事が全部同時刻に
-    # なるため、ここを `>` にすると上限で持ち越したはずの記事や、後から同日に追加された記事が
-    # 黙って消える(2026-09-22 Cloudflare Changelog: 同日 7 件のうち 4 件を喪失)。
-    return ts >= watermark
+    # threshold は透かしから LOOKBACK 遡った時刻。透かしと同時刻の記事や、前日付で後から現れた
+    # 記事は、処理済み ID に無い限り未読。ここを透かしちょうどで切ると、日付だけのフィードで
+    # 上限により持ち越した同日の記事が消え(2026-09-22 Cloudflare Changelog: 同日 7 件中 4 件)、
+    # 前日付で差し込まれた記事も消える(2026-09 の 7 日間で 14 件)。
+    return ts >= threshold
 
 
 def check_rss_feeds(config, state):
@@ -1140,11 +1211,19 @@ def check_rss_feeds(config, state):
             warnings.append((name, problem))
             continue
 
+        # categories: RSS のカテゴリで絞る（OpenAI の Company / Startup / Global Affairs のような
+        # 開発者向けでない投稿を落とす）。一致しない記事は最初から存在しないものとして扱うので、
+        # 既読状態にも透かしにも影響しない。
+        wanted = set() if is_sitemap else {c.strip().lower() for c in feed_cfg.get('categories', [])}
+        skipped_by_category = 0
         entries = []
         for entry in feed.entries:
             eid = entry_key(entry)
             link = getattr(entry, 'link', None)
             if not eid or not link:
+                continue
+            if wanted and not wanted & entry_categories(entry):
+                skipped_by_category += 1
                 continue
             entries.append(
                 {
@@ -1158,9 +1237,15 @@ def check_rss_feeds(config, state):
                     # ボット対策で本文が取れないホストは、URLではなくRSSの配信内容を投入する
                     'source_mode': source_mode,
                     'summary': entry_summary(entry),
+                    'has_content': entry_has_content(entry, link),
                 }
             )
 
+        if not entries and skipped_by_category:
+            # 絞り込みに合う記事が今の表示範囲に無いだけ（取得の失敗ではない）。通知はしない。
+            # 既読状態も作らないので、合う記事が現れた回が初回になり、その最新 1 件を処理する
+            print(f"[{name}] No entries in categories {sorted(wanted)} ({skipped_by_category} skipped).")
+            continue
         if not entries:
             print(f"[{name}] Warning: 有効なエントリがありません")
             warnings.append((name, '有効なエントリがありません'))
@@ -1184,10 +1269,11 @@ def check_rss_feeds(config, state):
                 'seen': seen or set(),
             }
         else:
-            watermark, recent_ids = read_feed_state(state, key)
+            watermark, floor, recent_ids = read_feed_state(state, key)
             first_run = watermark is None
             recent_set = set(recent_ids)
-            unread = [e for e in entries if is_unread(e['id'], e['ts'], watermark, recent_set)]
+            threshold = read_threshold(watermark, floor)
+            unread = [e for e in entries if is_unread(e['id'], e['ts'], threshold, recent_set)]
             result = {
                 'name': name,
                 'url': url,
@@ -1196,14 +1282,35 @@ def check_rss_feeds(config, state):
                 'entries': entries,
                 'first_run': first_run,
                 'watermark': watermark,
+                'floor': floor,
                 'recent_ids': recent_ids,
             }
+
+        # 余裕(headroom) = あと何件の新着で、その記事がフィードの表示範囲から押し出されるか。
+        # 全体上限で枠が足りない回は、余裕の小さい記事から処理する（select_articles）。
+        # sitemap は毎回全 URL を返すので押し出されない。
+        if is_sitemap:
+            for e in entries:
+                e['_headroom'] = NEVER_SCROLLS_OUT
+        else:
+            by_age = sorted(entries, key=lambda e: e['ts'] or EPOCH, reverse=True)
+            for rank, e in enumerate(by_age):
+                e['_headroom'] = len(by_age) - rank
 
         unread.sort(key=lambda e: e['ts'] or EPOCH)
         latest_mode = feed_cfg.get('mode') == 'latest' and not is_sitemap
         result['latest'] = latest_mode
 
-        if first_run:
+        if first_run and is_sitemap:
+            # sitemap の lastmod は「更新日」なので、どれが最新の記事かは決められない。lastmod 順で
+            # 1 件選ぶと、編集されただけの古いページや記事でないページを流してしまう
+            # （Claude Code の週まとめで 4 月の Week 14、anthropic.com/claude- で募集ページを選んでいた）。
+            # 初回は既読化だけにして、次回以降に現れた URL から放送する。
+            picked = []
+            print(
+                f"[{name}] First run: marking all {len(entries)} URLs as read (a sitemap cannot tell which is newest)."
+            )
+        elif first_run:
             # 初回は最新1件だけ処理し、残りは既読にする（過去記事の洪水を防ぐ）
             picked = unread[-1:]
             print(f"[{name}] First run: marking all {len(entries)} entries as read, processing the latest one.")
@@ -1289,38 +1396,45 @@ def advance_state(state, feed_results, processed, now=None):
         mark_all = result['first_run'] or (result.get('latest') and picked)
         if mark_all:
             dated = [e['ts'] for e in entries if e['ts']]
-            if prev_watermark:
-                dated.append(prev_watermark)  # フィードが縮んでも透かしは戻さない
-            new_watermark = max(dated) if dated else EPOCH
-            # 公開時刻を持たないエントリもすべて既読にする
-            dateless = [e['id'] for e in entries if e['ts'] is None]
         else:
             if not picked:
                 continue  # このフィードからは何も処理していない → 変更なし
             # 日付なしの記事しか処理しなかった場合も、既読(recent_ids)の記録は必要。
-            # picked_ts が空なら透かしは進めず維持する。
-            picked_ts = [e['ts'] for e in picked if e['ts']]
-            new_watermark = max([prev_watermark, *picked_ts]) if picked_ts else prev_watermark
-            # 2回目以降は、処理できたものだけを既読にする（残りは次回に持ち越す）
-            dateless = [e['id'] for e in picked if e['ts'] is None]
+            # その場合 dated が空なので透かしは進めず維持する。
+            dated = [e['ts'] for e in picked if e['ts']]
 
-        # 透かしと同時刻のエントリは時刻で区別できないので、IDで覚えておく。
-        # 記録するのは「処理した」ものだけ(初回は全既読なので全件)。同時刻の未処理分まで載せると、
-        # 持ち越したはずの記事が既読扱いで消える。is_unread が同時刻を未読に倒しているのは、
-        # このリストが「処理済みの同時刻 ID」を正確に持つことが前提。
-        tie_source = entries if mark_all else picked
-        ties = [e['id'] for e in tie_source if e['ts'] == new_watermark]
+        # 透かしは戻さない（フィードが縮んでも）。未来日付の記事では「今」より先へ進めない:
+        # 誤った日付 1 件で透かしが未来へ飛ぶと、その日までの記事が全部既読扱いになる。
+        new_watermark = max(dated) if dated else EPOCH
+        if new_watermark > now:
+            new_watermark = now
+        if prev_watermark:
+            new_watermark = max(new_watermark, prev_watermark)
+        # 振り返りの下限。初回はこの時点の透かし（それ以前は全件既読にしたので遡る必要がない）
+        floor = new_watermark if result['first_run'] else result.get('floor') or prev_watermark
+        threshold = read_threshold(new_watermark, floor)
 
-        merged = list(dict.fromkeys([*result['recent_ids'], *ties, *dateless]))
+        if mark_all:
+            # 全件既読。振り返り範囲に入る記事と日付なしの記事は、時刻では既読と判定できないので ID で覚える
+            recorded = [e['id'] for e in entries if e['ts'] is None or e['ts'] >= threshold]
+        else:
+            # 処理した記事は時刻に関係なく ID で覚える（公開時刻が後から動いても再放送しない）。
+            # 記録するのは「処理した」ものだけ。未処理の分まで載せると、持ち越したはずの記事や
+            # 前日付で差し込まれた記事が既読扱いで消える。is_unread が振り返り範囲を未読に倒して
+            # いるのは、このリストが処理済みの ID を正確に持つことが前提。
+            recorded = [e['id'] for e in picked]
+
+        merged = list(dict.fromkeys([*result['recent_ids'], *recorded]))
         kept = merged[-MAX_RECENT_IDS:]
 
-        # 公開時刻を持たないIDと、透かしと同時刻のIDは、透かしでは既読判定できずこのリストにしか
-        # 記録がない。上限で溢れさせると未読に戻ってしまうので、必ず残す。
-        must_keep = set(dateless) | {e['id'] for e in entries if e['ts'] == new_watermark}
+        # 振り返り範囲の記事と日付なしの記事は、透かしでは既読判定できずこのリストにしか記録がない。
+        # 上限で溢れさせると未読に戻ってしまうので、必ず残す（毎週日付が進む定期投稿もここで残り続ける）
+        must_keep = {e['id'] for e in entries if e['ts'] is None or e['ts'] >= threshold}
         rescued = [i for i in merged if i in must_keep and i not in kept]
 
         state[key] = {
             'watermark': new_watermark.isoformat(),
+            'floor': floor.isoformat(),
             'recent_ids': rescued + kept,
             # 最後に新着を確認した日時。停滞フィードの検知(check_stale_feeds)に使う。
             'last_new': now.isoformat(),
@@ -1360,10 +1474,20 @@ def _is_priority(article):
 
 
 def select_articles(candidates):
-    """全体上限を適用する。初回実行分（各フィード1件）と mode: latest 分（各フィード N 件）は常に通す。"""
+    """全体上限を適用する。初回実行分（各フィード1件）と mode: latest 分（各フィード N 件）は常に通す。
+
+    残りの枠は、フィードの表示範囲から押し出されるまでの余裕が小さい記事から埋め、同じ余裕なら古い順。
+    全体を古い順だけで切ると、障害明けのように古い記事を溜めたフィードが毎回枠を使い切り、
+    表示件数の少ないフィードの記事が枠を得る前にフィードから消える（2026-08-20〜09-13 に 135 件。
+    うち GitHub Changelog は 10 件 ≒ 1 日分しか表示せず、152 件中 101 件を失った）。
+    同じフィードの中では古いほど余裕が小さいので、フィード内の「古い順に消化」は変わらない。
+    """
     candidates = dedupe_by_link(candidates)
     priority = [a for a in candidates if _is_priority(a)]
-    rest = sorted([a for a in candidates if not _is_priority(a)], key=lambda e: e['ts'] or EPOCH)
+    rest = sorted(
+        [a for a in candidates if not _is_priority(a)],
+        key=lambda e: (e.get('_headroom', NEVER_SCROLLS_OUT), e['ts'] or EPOCH),
+    )
 
     remaining = max(MAX_ARTICLES_TOTAL - len(priority), 0)
     selected = priority + rest[:remaining]

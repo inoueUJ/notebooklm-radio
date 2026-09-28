@@ -172,6 +172,121 @@ def test_late_post_with_same_timestamp_is_detected(feed_box):
     assert run_once(state, feed_box)[0] == []
 
 
+# --- 前日付で後から現れる記事 / 公開時刻が後から動く記事（2026-09 の実測） ----------
+
+# 過去の日付で組む（未来日付は透かしが「今」で止まるので、テストが実時刻に依存してしまう）
+BASE = datetime.datetime(2026, 6, 1, tzinfo=UTC)
+DAY = datetime.timedelta(days=1)
+HOUR = datetime.timedelta(hours=1)
+
+
+def feed_of(*pairs):
+    """(番号, 公開時刻) の組からフィードを作る。実フィードと同じく新しい順に並べる。"""
+    entries = sorted((FakeEntry(i, ts) for i, ts in pairs), key=lambda e: e.published_parsed, reverse=True)
+    return FakeFeed(entries)
+
+
+def test_backdated_late_entry_is_detected(feed_box):
+    """透かしより前の日付で後から差し込まれた記事も拾う。
+
+    2026-09-23 の実例: OpenAI は 13:00 の記事を処理した後に、同じ日の 01:00〜12:00 付けの記事を
+    7 件出した。透かしだけの判定では現れた時点で既読扱いになり、一度も放送されなかった。
+    """
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)  # 初回
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 13 * HOUR))
+    assert run_once(state, feed_box)[0] == ['記事2']
+
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 13 * HOUR), (3, BASE + HOUR))
+    assert run_once(state, feed_box)[0] == ['記事3']
+    assert run_once(state, feed_box)[0] == []
+
+
+def test_lookback_stops_at_seven_days(feed_box):
+    """振り返りは LOOKBACK まで。それより古い日付で現れた記事は既読のまま（巨大フィードの再流入を防ぐ）。"""
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    later = BASE + 30 * DAY
+    feed_box['feed'] = feed_of((1, BASE), (2, later))
+    assert run_once(state, feed_box)[0] == ['記事2']
+
+    feed_box['feed'] = feed_of((1, BASE), (2, later), (3, later - 8 * DAY), (4, later - 6 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事4']
+
+
+def test_redated_entry_is_not_reprocessed(feed_box):
+    """処理済みの記事の公開時刻が後から動いても再放送しない。
+
+    2026-09 の実例: Vercel が記事の日付を付け直し（Atom の updated が動く）、09-26 に放送した記事が
+    09-29 に新着として再放送された。Claude Code の what's new でも Week 33 の日付が 24 日動いた。
+    """
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    # 同じ回に 2 件処理する。記事2 は透かし（記事3 の時刻）と同時刻ではないので、同時刻の分だけ
+    # 覚える方式では ID が残らない（Vercel の実例もこの形）
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY), (3, BASE + 2 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事2', '記事3']
+
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 4 * DAY), (3, BASE + 2 * DAY))  # 記事2 の日付が後ろへ動く
+    assert run_once(state, feed_box)[0] == []
+
+
+def test_weekly_redated_post_stays_read_after_ids_overflow(feed_box, monkeypatch):
+    """毎週日付が進む定期投稿（Cloudflare の WAF 予定、Google Cloud の What's new）は、
+    処理済み ID が上限を超えて溢れても再浮上しない。振り返り範囲にいる間は ID を消さないため。"""
+    monkeypatch.setattr(rb, 'MAX_RECENT_IDS', 3)
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    rolling = 900
+    feed_box['feed'] = feed_of((1, BASE), (rolling, BASE + DAY))
+    assert run_once(state, feed_box)[0] == [f'記事{rolling}']
+
+    for week in range(1, 8):
+        start = BASE + 7 * week * DAY
+        # 毎週 2 件の新着。1 回の上限(3)に余裕を残し、定期投稿が未読に戻れば必ず拾われる形にする
+        fresh = [(100 * week + k, start + k * HOUR) for k in range(2)]
+        feed_box['feed'] = feed_of((1, BASE), (rolling, start + DAY), *fresh)
+        titles, _ = run_once(state, feed_box)
+        assert sorted(titles) == sorted(f'記事{i}' for i, _ in fresh)
+
+
+def test_state_without_floor_does_not_replay_last_week(feed_box):
+    """振り返り導入前の state（処理済み ID を同時刻の分しか残していない）に切り替えても、
+    過去 1 週間分を再放送しない。振り返りは移行時点の透かしより前へ遡らない。"""
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 2 * DAY), (3, BASE + 4 * DAY))
+    state = {FEED_URL: {'watermark': (BASE + 4 * DAY).isoformat(), 'recent_ids': ['post-00003']}}
+    assert run_once(state, feed_box)[0] == []
+
+    # 移行後に前日付で差し込まれた記事は拾う
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 2 * DAY), (3, BASE + 4 * DAY), (4, BASE + 5 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事4']
+    assert state[FEED_URL]['floor'] == (BASE + 4 * DAY).isoformat()
+    feed_box['feed'] = feed_of(
+        (1, BASE), (2, BASE + 2 * DAY), (3, BASE + 4 * DAY), (4, BASE + 5 * DAY), (5, BASE + 4 * DAY + HOUR)
+    )
+    assert run_once(state, feed_box)[0] == ['記事5']
+    assert run_once(state, feed_box)[0] == []
+
+
+def test_future_dated_entry_does_not_push_watermark_past_now(feed_box):
+    """誤った未来日付 1 件で透かしが未来へ飛ぶと、その日付までの記事が全部既読になる。透かしは「今」で止める。"""
+    now = datetime.datetime.now(UTC)
+    feed_box['feed'] = feed_of((1, now - DAY))
+    state = {}
+    run_once(state, feed_box)
+    feed_box['feed'] = feed_of((1, now - DAY), (2, now + 365 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事2']
+    assert datetime.datetime.fromisoformat(state[FEED_URL]['watermark']) <= datetime.datetime.now(UTC)
+
+    feed_box['feed'] = feed_of((1, now - DAY), (2, now + 365 * DAY), (3, now - HOUR))
+    assert run_once(state, feed_box)[0] == ['記事3']
+    assert run_once(state, feed_box)[0] == []  # 未来日付の記事自体も、処理済み ID で既読のまま
+
+
 def test_many_same_timestamp_entries_do_not_oscillate(feed_box):
     """同時刻の ID は recent_ids の上限で溢れても未読に戻らない。"""
     feed_box['feed'] = same_day_feed(range(1, rb.MAX_RECENT_IDS + 51))
@@ -302,6 +417,42 @@ def test_select_articles_keeps_oldest_and_all_first_runs():
     assert rest == [f't{i}' for i in range(rb.MAX_ARTICLES_TOTAL - 1)]
 
 
+def test_total_cap_serves_short_window_feeds_first(monkeypatch):
+    """全体上限の枠は、フィードから押し出されそうな記事に先に回す。
+
+    2026-08-20〜09-13 の実測: 障害明けに古い記事を溜めた Vercel などが毎回 15 枠を使い切り、
+    10 件しか表示しない GitHub Changelog は 30 回連続で枠を得られず、152 件中 101 件が
+    処理される前にフィードから消えた。
+    """
+    monkeypatch.setattr(rb, 'MAX_ARTICLES_TOTAL', 4)
+    big = make_feed(1000)  # Vercel 相当: 表示範囲が広く、古い記事が溜まっていても消えない
+    small = make_feed(10, start=datetime.datetime(2026, 1, 1, tzinfo=UTC))  # GitHub 相当: 10 件だけ
+    for e in small.entries:
+        e.id, e.link = f'small-{e.id}', f'https://small.example/{e.id}'
+    feeds = {'https://big.example/feed': big, 'https://small.example/feed': small}
+    monkeypatch.setattr(rb, 'fetch_feed', lambda url: (feeds[url], None))
+    config = {
+        'feeds': [
+            {'name': 'Big', 'url': 'https://big.example/feed'},
+            {'name': 'Small', 'url': 'https://small.example/feed'},
+        ]
+    }
+    # Big は表示範囲の上の方 10 件だけが未読（溜まっているが、押し出されるまで 990 件の余裕がある）。
+    # 時刻は Big の方が古いので、古い順だけで切ると Big が 3 枠を取り、Small は 1 枠しか得られない
+    big_mark = (datetime.datetime(2020, 1, 1, tzinfo=UTC) + datetime.timedelta(hours=990)).isoformat()
+    small_mark = datetime.datetime(2025, 12, 1, tzinfo=UTC).isoformat()
+    state = {
+        'https://big.example/feed': {'watermark': big_mark, 'recent_ids': []},
+        'https://small.example/feed': {'watermark': small_mark, 'recent_ids': []},
+    }
+
+    candidates, _results, _ = rb.check_rss_feeds(config, state)
+    selected = [a['feed_name'] for a in rb.select_articles(candidates)]
+
+    # Small の 3 件（押し出し寸前）が先に入り、残り 1 枠が Big の最古
+    assert selected.count('Small') == 3 and selected.count('Big') == 1
+
+
 # --- Secret のマスキング -----------------------------------------------------
 
 
@@ -385,7 +536,8 @@ def test_sitemap_feed_end_to_end_detects_new_article(monkeypatch):
         return [a['link'] for a in candidates]
 
     state = {}
-    assert run(state) == ['https://example.com/news/hello-world']  # 初回は最新1件
+    # 初回は既読化だけ。lastmod は更新日なので「最新」を決められず、選ぶと古いページを流しかねない
+    assert run(state) == []
     assert run(state) == []  # 変化なし
 
     box['content'] = SITEMAP_XML.replace(
@@ -457,10 +609,7 @@ def test_sitemap_feeds_sharing_url_have_independent_state(monkeypatch):
     monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
 
     state = {}
-    assert sorted(sitemap_run(SHARED_CONFIG, state)) == [
-        'https://example.com/eng/intro',
-        'https://example.com/news/first',
-    ]
+    assert sitemap_run(SHARED_CONFIG, state) == []  # 初回は既読化だけ
     # state はフィードごとに独立したキーで持つ
     assert 'sitemap:https://example.com/sitemap.xml:https://example.com/news/' in state
     assert 'sitemap:https://example.com/sitemap.xml:https://example.com/eng/' in state
@@ -733,10 +882,10 @@ def make_source_cli(box):
     def fake_cli(args, retries=1):
         box['calls'].append(args)
         if args[:2] == ['source', 'add']:
-            # URL投入は args[2] がURL、テキスト投入は本文なので --title から引く
+            # URL投入は args[2] がURL、テキスト投入は本文なので --title（"記事名 | フィード名"）の記事名から引く
             if '--type' in args:
                 title = next(a.split('=', 1)[1] for a in args if a.startswith('--title='))
-                return {'source': {'id': box['ids'][title]}}
+                return {'source': {'id': box['ids'][title.rsplit(' | ', 1)[0]]}}
             return {'source': {'id': box['ids'][args[2]]}}
         if args[:2] == ['source', 'list']:
             return {'sources': box['sources']}
@@ -884,7 +1033,77 @@ def test_text_and_url_sources_mix_in_one_notebook(monkeypatch):
 
 def test_title_starting_with_dash_is_not_parsed_as_an_option():
     args = rb.source_add_args({**TEXT_ARTICLE, 'title': '--force とは何か'}, 'nb1')
-    assert '--title=--force とは何か' in args
+    assert '--title=--force とは何か | OpenAI' in args
+
+
+def test_text_source_title_names_the_feed():
+    """変更履歴の "2.1.283" だけではソース一覧で何の話か分からないので、フィード名を添える。"""
+    args = rb.source_add_args({**TEXT_ARTICLE, 'title': '2.1.283', 'feed_name': 'Claude Code Changelog'}, 'nb1')
+    assert '--title=2.1.283 | Claude Code Changelog' in args
+
+
+# 変更履歴の RSS は 1 項目の全文を content:encoded で配信し、リンクは 1 枚のページの #アンカー。
+# URL を渡すとページ全体（全履歴）が項目数だけ重複して入るので、テキスト投入で項目の本文だけを入れる。
+CHANGELOG_ARTICLE = {
+    **TEXT_ARTICLE,
+    'title': '2.1.283',
+    'link': 'https://code.example/docs/changelog#2-1-283',
+    'feed_name': 'Claude Code Changelog',
+    'summary': 'Added deniedModels managed setting to block specific models',
+    'has_content': True,
+}
+
+
+def test_text_source_with_feed_content_says_it_is_the_feed_body():
+    """本文を配信しているフィードを「要約のみ」と書かない（ラジオが不要に口ごもる）。"""
+    body = rb.build_text_source(CHANGELOG_ARTICLE)
+
+    assert '配信されている本文' in body
+    assert '記事の全文ではありません' not in body
+    assert 'ボット対策' not in body  # 取り込めない理由はボット対策とは限らない
+    assert '推測で補わず' in body  # 本文でも「書いていないことは補わない」は残す
+    assert CHANGELOG_ARTICLE['summary'] in body
+
+
+def test_has_content_distinguishes_content_from_description(feed_box):
+    """content:encoded / Atom content は本文、description だけなら要約として運ぶ。"""
+    with_content = FakeEntry(1, datetime.datetime(2026, 9, 25, tzinfo=UTC))
+    with_content.content = [{'value': '<ul><li>Added deniedModels</li></ul>'}]
+    description_only = FakeEntry(2, datetime.datetime(2026, 9, 26, tzinfo=UTC))
+    description_only.summary = '<p>Short teaser</p>'
+    feed_box['feed'] = FakeFeed([description_only, with_content])
+    config = {'feeds': [{'name': 'Example', 'url': FEED_URL, 'source_mode': 'text'}]}
+
+    candidates, _, _ = rb.check_rss_feeds(
+        config, {'https://example.com/feed': {'watermark': '2026-09-01T00:00:00+00:00'}}
+    )
+
+    by_title = {a['title']: a for a in candidates}
+    assert by_title['記事1']['has_content'] is True
+    assert by_title['記事1']['summary'] == 'Added deniedModels'
+    assert by_title['記事2']['has_content'] is False
+
+
+def test_anchor_linked_description_counts_as_the_entry_body(feed_box):
+    """リンクが 1 ページ内の #アンカーなら、description でも項目の全文（Claude Platform のリリースノート）。"""
+    entry = FakeEntry(1, datetime.datetime(2026, 9, 24, tzinfo=UTC))
+    entry.link = 'https://docs.example/release-notes/overview#september-24-2026'
+    entry.summary = '<p>Launched Claude Opus 5.5 on the API.</p>'
+    feed_box['feed'] = FakeFeed([entry])
+    config = {'feeds': [{'name': 'Platform', 'url': FEED_URL, 'source_mode': 'text'}]}
+
+    candidates, _, _ = rb.check_rss_feeds(config, {})
+
+    assert candidates[0]['has_content'] is True
+    assert '記事の全文ではありません' not in rb.build_text_source(candidates[0])
+
+
+def test_notification_does_not_mark_feed_body_sources_as_summary_only(monkeypatch):
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    rb.send_notification('https://hooks.slack.com/x', [CHANGELOG_ARTICLE])
+
+    assert '要約のみ' not in posted[0]['text']
 
 
 def test_feed_source_mode_and_summary_reach_the_article(feed_box):
@@ -898,6 +1117,64 @@ def test_feed_source_mode_and_summary_reach_the_article(feed_box):
 
     assert candidates[0]['source_mode'] == 'text'
     assert candidates[0]['summary'] == 'Hello & welcome'  # タグは落ちて実体参照は戻る
+
+
+def tagged(index, published, *terms):
+    entry = FakeEntry(index, published)
+    entry.tags = [{'term': t} for t in terms]
+    return entry
+
+
+def test_categories_keep_only_matching_entries(feed_box):
+    """categories で絞ると、一致しない記事は候補にも既読状態にも現れない（OpenAI の Company / Startup 等）。"""
+    config = {'feeds': [{'name': 'OpenAI', 'url': FEED_URL, 'categories': ['Product', 'Research']}]}
+    feed_box['feed'] = FakeFeed([tagged(1, BASE, 'Product')])
+    state = {}
+    run_once(state, feed_box, config)  # 初回
+
+    feed_box['feed'] = FakeFeed(
+        [
+            tagged(4, BASE + 3 * HOUR, 'Startup'),
+            tagged(3, BASE + 2 * HOUR, 'research'),  # 大文字小文字は区別しない
+            tagged(2, BASE + HOUR, 'Company', 'Global Affairs'),
+            tagged(1, BASE, 'Product'),
+        ]
+    )
+    assert run_once(state, feed_box, config)[0] == ['記事3']
+    assert run_once(state, feed_box, config)[0] == []
+
+
+def test_categories_matching_nothing_is_quiet_and_waits(feed_box):
+    """絞り込みに合う記事が表示範囲に無いだけなら、警告も既読化もしない。合う記事が現れた回を初回にする。"""
+    config = {'feeds': [{'name': 'OpenAI', 'url': FEED_URL, 'categories': ['Product']}]}
+    feed_box['feed'] = FakeFeed([tagged(1, BASE, 'Company')])
+    state = {}
+    titles, warnings = run_once(state, feed_box, config)
+    assert titles == [] and warnings == [] and FEED_URL not in state
+
+    feed_box['feed'] = FakeFeed([tagged(2, BASE + HOUR, 'Product'), tagged(1, BASE, 'Company')])
+    assert run_once(state, feed_box, config)[0] == ['記事2']
+
+
+def test_validate_categories():
+    base = {'feeds': [{'name': 'A', 'url': 'https://a.example/feed'}]}
+    bad = {'feeds': [{**base['feeds'][0], 'categories': 'Product'}]}
+    with pytest.raises(rb.ConfigError, match='categories'):
+        rb.validate_config(bad)
+    ok = {'feeds': [{**base['feeds'][0], 'categories': ['Product']}]}
+    assert rb.validate_config(ok) == []
+    sitemap = {
+        'feeds': [
+            {
+                'name': 'S',
+                'url': 'https://s.example/sitemap.xml',
+                'type': 'sitemap',
+                'prefix': 'https://s.example/',
+                'categories': ['X'],
+            }
+        ]
+    }
+    assert any('categories' in w for w in rb.validate_config(sitemap))
 
 
 def test_default_source_mode_is_url(feed_box):

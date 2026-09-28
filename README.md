@@ -81,7 +81,8 @@ flowchart LR
 |---|---|
 | `feeds[].topic` | トピックごとに 1 日 1 ノートブック、1 本のラジオになる。関係ない話題を混ぜると番組が散らかるので分ける。 |
 | `feeds[].type: sitemap` | RSS のないサイト向け。`sitemap.xml` を読み、`prefix` 配下の URL を記事として扱う。 |
-| `feeds[].source_mode: text` | ボット対策で NotebookLM の取得が弾かれるホスト向け。URL の代わりに RSS の要約をテキストとして入れ、「要約のみ」と明示する。 |
+| `feeds[].source_mode: text` | 記事 URL を渡しても中身が正しく入らないフィード向け。ボット対策で NotebookLM の取得が弾かれるホストと、リンクが 1 ページ内の `#` 位置になっている変更履歴がこれにあたる(URL のままだとページ全体が毎回入る)。URL の代わりにフィードの配信内容をテキストとして入れる。本文が配信されていれば本文を、要約しかなければ「要約のみ」と明示して入れる。 |
+| `feeds[].categories` | RSS のカテゴリで記事を絞る。書いたカテゴリのどれかが付いた記事だけを拾う(大文字小文字は区別しない)。発表と会社の話題や導入事例が混ざるフィードで `[Product, Research]` のように使う。sitemap 型では無視される。 |
 | `feeds[].mode: latest` | アグリゲータのように流量の多いフィード向け。毎回最新の N 件だけ拾い、残りは意図的に既読にする。既定の backlog モードは古い順に消化して何も捨てない。 |
 | `topics.<name>.audio` | トピック別に音声設定を上書きする。`format`(deep-dive / brief / critique / debate)、`length`、`prompt`、`language`。 |
 | `settings.notebook_title_format` | 自動削除の対象は、この形式に完全一致するタイトルだけ。手で作ったノートブックには触らない。 |

@@ -90,4 +90,12 @@ The design rationale in this repo is earned. Dates preserved from the original p
 
 **2026-09 — the Vercel double.** `vercel.com/blog/feed` and `vercel.com/atom` return identical content. Every Vercel article was added as two sources, listed twice, and used two of the 15 per-run slots, on 26 of 27 runs with articles. Fix: cross-feed URL deduplication; both feeds still advance.
 
+**2026-08-20 → 09-13 — the starved window.** After the credential outage, several feeds had a backlog of old articles, and the per-run total (15) was filled strictly oldest-first. GitHub Changelog shows only its newest 10 items (about a day); it had 10 unread items on every run from 09-01 to 09-13, got zero slots in 30 capped runs, and 101 of its 152 posts scrolled out of the feed before being processed (Google Cloud lost 32 the same way, 135 in total). Fix: the total cap is filled by how close an article is to scrolling out of its feed, then by age.
+
+**2026-09 — backdated late arrivals.** Feeds insert items dated earlier than items they have already published (OpenAI on 09-23: seven posts dated 01:00–12:00 appeared after a 13:00 post had been processed; Cloudflare's changelog back-fills entries up to two days late). Each was older than the watermark on arrival and was read without being processed — 37 in September. Fix: a 7-day lookback below the watermark, gated by a record of every processed ID.
+
+**2026-09 — re-dated articles aired twice.** Vercel re-dated an edited post, which re-crossed the watermark and aired again three days later; Claude Code's what's-new feed changed an old week's date (and its content-hash GUID) and aired it as new. Fix: every processed ID is remembered (the what's-new feed also moved to per-week pages read from the sitemap).
+
+**2026-09 — anchor-linked changelogs imported whole pages.** The Codex changelog links every entry to a `#fragment` of one ~1.4 MB page; NotebookLM imports the page, so 42 adds in a month were 21+ copies of the entire history (three in one notebook). Fix: `source_mode: text` submits each entry's own text, labeled as the feed's body rather than as a summary.
+
 **2026-09 — audio failure left articles unread.** If `generate audio` failed after the sources were added, the topic counted as failed and its articles stayed unread, so the next run re-added the same URLs. Fix: those articles are marked read and the failure is reported separately with the CLI's error code, so a daily-quota rejection (`rate_limited`) is visible instead of an opaque exit code.
