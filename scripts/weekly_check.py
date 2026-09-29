@@ -150,15 +150,54 @@ def build_query(config, now):
     )
 
 
-def classify_found(found, aired, feed_links, followed_sites):
+def feed_scopes(config, results):
+    """各フィードの守備範囲を [(接頭辞, 途中まで一致でよいか)] で返す。
+
+    sitemap は設定の prefix（anthropic.com/claude- のように / で終わらないものは途中一致）。RSS は記事リンクの
+    親パスの共通部分。ラベル別・カテゴリ別のフィードでも、記事はサイトの同じ場所（github.blog/changelog/ 等）に
+    並ぶので、そこに置かれた記事は「絞り込みでわざと外したもの」とみなせる。
+    """
+    scopes = []
+    for feed in config.get('feeds', []):
+        if feed.get('type') == 'sitemap' and feed.get('prefix'):
+            scopes.append((norm(feed['prefix']), not feed['prefix'].endswith('/')))
+    for result in results:
+        if result.get('mode') == 'sitemap' or not result['entries']:
+            continue
+        parents = [norm(e['link']).split('/')[:-1] for e in result['entries']]
+        common = []
+        for segments in zip(*parents, strict=False):  # 最短のパスで止める
+            if len(set(segments)) != 1:
+                break
+            common.append(segments[0])
+        if common:
+            scopes.append(('/'.join(common), False))
+    return scopes
+
+
+def watch_matches(config, url):
+    """Slack だけに知らせる監視（watch:）の対象か。本体と同じく URL に対するキーワードの部分一致で見る。"""
+    for watch in config.get('watch') or []:
+        if norm(url).startswith(norm(watch['prefix']) + '/'):
+            keywords = [k.lower() for k in watch.get('keywords', [])]
+            if not keywords or any(k in url.lower() for k in keywords):
+                return True
+    return False
+
+
+def classify_found(found, aired, feed_links, followed_sites, scopes=(), watched=lambda url: False):
     """Deep Research が見つけた URL を分ける。
 
     - aired: ラジオで流したもの
     - in_feeds: どこかのフィードに載っている（見送り・絞り込み・待ちのどれか）
-    - gaps: 購読しているサイトの記事なのに、どのフィードにも載っていない（購読の穴）
+    - watched: Slack だけに知らせる監視の対象
+    - filtered: 購読しているフィードの守備範囲にあるが、ラベル・カテゴリの絞り込みでわざと外しているもの
+    - gaps: 購読しているサイトの、どのフィードの守備範囲にも入らない記事（購読の穴。
+      /news/ の外にあった anthropic.com/claude-opus-5-5 がこれ）
     - elsewhere: 購読していないサイト（ニュースサイトや、まだ購読していない一次情報）
+    記事の一覧ページそのもの（anthropic.com/news など）は数えない。
     """
-    groups = {'aired': [], 'in_feeds': [], 'gaps': [], 'elsewhere': []}
+    groups = {'aired': [], 'in_feeds': [], 'watched': [], 'filtered': [], 'gaps': [], 'elsewhere': []}
     seen = set()
     for item in found:
         key = norm(item['url'])
@@ -169,6 +208,12 @@ def classify_found(found, aired, feed_links, followed_sites):
             groups['aired'].append(item)
         elif key in feed_links:
             groups['in_feeds'].append(item)
+        elif any(link.startswith(key + '/') for link in feed_links):
+            continue  # 記事の一覧ページ
+        elif watched(item['url']):
+            groups['watched'].append(item)
+        elif any(key.startswith(s) if partial else key == s or key.startswith(s + '/') for s, partial in scopes):
+            groups['filtered'].append(item)
         elif site_of(item['url']) in followed_sites:
             groups['gaps'].append(item)
         else:
@@ -283,10 +328,12 @@ def _problem_lines(warnings, article_problems, recon, recall, is_discord):
         if isinstance(recall, str):
             lines.append(f"🔎 取りこぼし検査は今週は失敗した（{recall}）")
         else:
-            followed = len(recall['aired']) + len(recall['in_feeds']) + len(recall['gaps'])
+            followed = sum(len(recall[k]) for k in ('aired', 'in_feeds', 'watched', 'filtered', 'gaps'))
             lines.append(
                 f"🔎 取りこぼし検査（Deep Research）: 購読中のサイトの記事 {followed} 件のうち、"
-                f"流した {len(recall['aired'])}・フィードにある {len(recall['in_feeds'])}・どのフィードにも無い {len(recall['gaps'])}"
+                f"流した {len(recall['aired'])}・フィードにある {len(recall['in_feeds'])}・"
+                f"見張り中 {len(recall['watched'])}・絞り込みで外している {len(recall['filtered'])}・"
+                f"購読の穴 {len(recall['gaps'])}"
             )
             lines += [f"・{_link(i['url'], i['title'], is_discord)}" for i in recall['gaps'][:LIST_MAX]]
             others = Counter(site_of(i['url']) for i in recall['elsewhere'])
@@ -322,7 +369,14 @@ def main():
                     feed_links = {norm(e['link']) for r in results for e in r['entries']}
                     followed = {site_of(f['url']) for f in config['feeds']}
                     followed |= {site_of(e['link']) for r in results for e in r['entries']}
-                    recall = classify_found(found, recon['aired'], feed_links, followed)
+                    recall = classify_found(
+                        found,
+                        recon['aired'],
+                        feed_links,
+                        followed,
+                        feed_scopes(config, results),
+                        lambda url: watch_matches(config, url),
+                    )
                 except Exception as e:
                     print(f"Recall check failed: {rb.redact(e)}", file=sys.stderr)
                     recall = rb.redact(describe_recall_failure(e))

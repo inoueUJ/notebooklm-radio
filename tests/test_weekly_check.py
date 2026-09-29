@@ -92,20 +92,53 @@ def test_classify_found_separates_gaps_from_what_was_aired_or_is_in_feeds():
     found = [
         {'url': 'https://www.anthropic.com/news/aired#x', 'title': 'aired'},
         {'url': 'https://www.anthropic.com/news/in-feed/', 'title': 'in feed'},
+        {'url': 'https://www.anthropic.com/news', 'title': 'listing page'},
+        {'url': 'https://support.claude.com/en/articles/1-release-notes', 'title': 'watched'},
+        {'url': 'https://github.blog/changelog/2026-09-24-copilot-thing/', 'title': 'outside my labels'},
         {'url': 'https://www.anthropic.com/claude-opus-9', 'title': 'gap'},
         {'url': 'https://techcrunch.com/story', 'title': 'news'},
         {'url': 'https://www.anthropic.com/claude-opus-9?ref=x', 'title': 'duplicate of gap'},
     ]
+    config = {
+        'feeds': [
+            {'name': 'A', 'type': 'sitemap', 'url': 's', 'prefix': 'https://www.anthropic.com/news/'},
+            {'name': 'GitHub Actions', 'url': 'https://github.blog/changelog/label/actions/feed/'},
+        ],
+        'watch': [
+            {
+                'name': 'W',
+                'url': 'w',
+                'prefix': 'https://support.claude.com/en/articles/',
+                'keywords': ['release-notes'],
+            }
+        ],
+    }
+    github = rss_result([entry(1, NOW, 'https://github.blog/changelog/2026-09-20-actions-x/')], name='GitHub Actions')
     groups = wc.classify_found(
         found,
         aired={'www.anthropic.com/news/aired'},
-        feed_links={'www.anthropic.com/news/in-feed'},
-        followed_sites={'anthropic.com'},
+        feed_links={'www.anthropic.com/news/in-feed', 'github.blog/changelog/2026-09-20-actions-x'},
+        followed_sites={'anthropic.com', 'github.blog', 'claude.com'},
+        scopes=wc.feed_scopes(config, [github]),
+        watched=lambda url: wc.watch_matches(config, url),
     )
     assert [i['title'] for i in groups['aired']] == ['aired']
     assert [i['title'] for i in groups['in_feeds']] == ['in feed']
+    assert [i['title'] for i in groups['watched']] == ['watched']
+    assert [i['title'] for i in groups['filtered']] == ['outside my labels']
     assert [i['title'] for i in groups['gaps']] == ['gap']
     assert [i['title'] for i in groups['elsewhere']] == ['news']
+
+
+def test_feed_scopes_use_sitemap_prefixes_and_common_article_paths():
+    config = {'feeds': [{'name': 'M', 'type': 'sitemap', 'url': 's', 'prefix': 'https://www.anthropic.com/claude-'}]}
+    cloud = rss_result(
+        [
+            entry(1, NOW, 'https://cloud.google.com/blog/topics/developers-practitioners/a'),
+            entry(2, NOW, 'https://cloud.google.com/blog/products/ai-machine-learning/b'),
+        ]
+    )
+    assert wc.feed_scopes(config, [cloud]) == [('www.anthropic.com/claude-', True), ('cloud.google.com/blog', False)]
 
 
 def test_build_query_default_and_custom():
@@ -131,6 +164,8 @@ def test_message_lists_problems_and_recall_gaps():
     recall = {
         'aired': [{'url': 'u1', 'title': 't'}],
         'in_feeds': [],
+        'watched': [],
+        'filtered': [{'url': 'u2', 'title': 'f'}],
         'gaps': [{'url': 'https://www.anthropic.com/claude-opus-9', 'title': 'Opus 9'}],
         'elsewhere': [{'url': 'https://techcrunch.com/a', 'title': 'x'}],
     }
