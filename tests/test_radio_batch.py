@@ -544,6 +544,72 @@ def test_total_cap_serves_short_window_feeds_first(monkeypatch):
     assert selected.count('Small') == 3 and selected.count('Big') == 1
 
 
+# --- 実行のたびの警告と実行記録 -----------------------------------------------
+
+
+def test_warns_when_every_visible_entry_is_unread(feed_box):
+    """見えている記事が全部未読 = それより古い記事は処理前に消えたかもしれない（GitHub で 101 件を失った形）。"""
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    feed_box['feed'] = feed_of(*[(i, BASE + i * HOUR) for i in range(2, 12)])  # 表示 10 件がすべて新着
+    _titles, warnings = run_once(state, feed_box)
+    assert any('すべて未読' in reason for _name, reason in warnings)
+
+    feed_box['feed'] = feed_of((1, BASE), *[(i, BASE + i * HOUR) for i in range(2, 12)])
+    assert not any('すべて未読' in reason for _name, reason in run_once(state, feed_box)[1])
+
+
+def test_warns_when_url_mode_feed_links_share_one_page(feed_box):
+    """#アンカーのリンクを URL のまま渡すとページ全体が毎回入る（Codex で 42 回）。text 指定なら黙る。"""
+    entries = [FakeEntry(i, BASE + i * HOUR) for i in range(1, 4)]
+    for e in entries:
+        e.link = f'https://docs.example/changelog#v{e.id}'
+    feed_box['feed'] = FakeFeed(list(reversed(entries)))
+
+    _c, _r, warnings = rb.check_rss_feeds(CONFIG, {})
+    assert any('# 位置' in reason for _name, reason in warnings)
+
+    text_config = {'feeds': [{'name': 'Example', 'url': FEED_URL, 'source_mode': 'text'}]}
+    _c, _r, warnings = rb.check_rss_feeds(text_config, {})
+    assert not any('# 位置' in reason for _name, reason in warnings)
+
+
+def test_record_run_keeps_a_bounded_history(monkeypatch):
+    monkeypatch.setattr(rb, 'MAX_RUN_HISTORY', 3)
+    state = {}
+    for i in range(5):
+        rb.record_run(state, BASE + i * DAY, [f'https://a.example/{i}'], [], [], ['New feed'] if i == 0 else [])
+    runs = state[rb.RUNS_KEY]
+    assert len(runs) == 3
+    assert runs[-1]['aired'] == ['https://a.example/4'] and runs[-1]['at'] == (BASE + 4 * DAY).isoformat()
+
+
+def test_run_history_does_not_look_like_a_feed_to_the_host_check(feed_box):
+    """実行記録（_runs）は state の中にあるが、同じホストの既読判定には混ざらない。"""
+    state = {rb.RUNS_KEY: [{'at': BASE.isoformat(), 'aired': ['https://example.com/1']}]}
+    assert rb.host_covered_until(state, FEED_URL, FEED_URL) is None
+
+
+def test_recall_notebooks_are_cleaned_up_only_when_enabled():
+    config = {
+        'feeds': [{'name': 'A', 'url': 'https://a.example/feed', 'topic': 'AI'}],
+        'settings': {'notebook_title_format': 'Tech Radio {topic} {date}'},
+    }
+    matches = lambda cfg: any(p.fullmatch('Tech Radio Recall 2026-09-01') for p in rb._notebook_title_patterns(cfg))  # noqa: E731
+    assert not matches(config)
+    assert matches({**config, 'weekly_check': {'recall': True}})
+
+
+def test_validate_weekly_check():
+    base = {'feeds': [{'name': 'A', 'url': 'https://a.example/feed'}]}
+    assert rb.validate_config({**base, 'weekly_check': {'recall': True, 'recall_query': 'q'}}) == []
+    with pytest.raises(rb.ConfigError, match='weekly_check'):
+        rb.validate_config({**base, 'weekly_check': {'recall': 'yes'}})
+    with pytest.raises(rb.ConfigError, match='weekly_check'):
+        rb.validate_config({**base, 'weekly_check': {'typo': True}})
+
+
 # --- Secret のマスキング -----------------------------------------------------
 
 

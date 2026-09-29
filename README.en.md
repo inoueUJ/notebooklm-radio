@@ -74,6 +74,7 @@ Everything lives in `config.yaml` (annotated inline):
 | `feeds[].type: sitemap` | For sites with no RSS: reads `sitemap.xml`, treats URLs under `prefix` as articles. |
 | `feeds[].source_mode: text` | For feeds whose article URL doesn't give NotebookLM the article: hosts that answer its fetcher with a bot challenge, and changelogs whose links are `#anchors` on one long page (by URL, NotebookLM imports the whole page for every entry). Submits the feed's own text instead of the URL: the full body when the feed carries one, otherwise the summary, clearly labeled as summary-only. |
 | `feeds[].categories` | Keep only items tagged with one of these RSS categories (case-insensitive), e.g. `[Product, Research]` for a feed that mixes launches with company news and customer stories. Ignored for sitemaps. |
+| `weekly_check.recall` | Let the weekly check use NotebookLM's Deep Research to find official announcements no feed carried (once a week). `recall_query` changes the question; `{start}` and `{end}` become the week's dates. |
 | `feeds[].mode: latest` | For aggregators and other firehoses: each run takes only the newest N and deliberately marks the rest read, instead of draining a backlog oldest-first. |
 | `topics.<name>.audio` | Per-topic Audio Overview overrides — `format` (deep-dive / brief / critique / debate), `length`, `prompt`, `language`. |
 | `settings.notebook_title_format` | Cleanup only deletes notebooks whose title **fully matches** this — your manual notebooks are structurally safe. |
@@ -90,6 +91,7 @@ Validate your edits without running anything: `python radio_batch.py --check-con
 
 - **Auth expires ~every 3.5 weeks.** You'll get an error notification naming the cause; recovery is re-running step 2 and step 3's first command. Full runbook: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 - **Silence means breakage.** A no-news day still sends a 😪 ping. If you hear nothing at all, check the Actions tab.
+- **A weekly check arrives on Sunday (🗓).** Feed health, and what the week's feeds published versus what was aired (not aired, aired twice); two lines when all is well. With `weekly_check.recall: true`, NotebookLM's Deep Research also looks for the week's official announcements that no feed carried (one Deep Research a week).
 - **Audio generation is fire-and-forget.** The notification says generation *started*; a failed render on Google's side does not fail the run. If generation can't even be *started* (typically NotebookLM's daily Audio Overview quota: 3 on the free tier), the articles are still in the notebook and you get a separate error message with the cause — generate the overview by hand in the app.
 - **Private repos and Actions minutes:** two runs/day fits comfortably in the free tier (runs are typically a few minutes; 30 min is a worst-case timeout), but keep an eye on your usage.
 

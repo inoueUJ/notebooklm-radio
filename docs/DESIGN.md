@@ -103,6 +103,16 @@ Documented so they aren't "fixed" casually:
 - **No dry-run mode for the batch itself.** The script's side effects are the product. Verification is `pytest -q` (no network — the CLI boundary and feed fetching are monkeypatched); real execution happens only via `gh workflow run`. `--check-config` is not a dry run: it validates `config.yaml` and exits without touching feeds, NotebookLM or state.
 - **No User-Agent spoofing.** See above.
 
+## Weekly check: verification, not just monitoring
+
+The per-run notifications say what happened in one run. They can't say what *didn't* happen — an article that scrolled out of a feed before it was processed leaves no trace in any run. The 279 lost articles of September were only found by reconciling a month of logs against the feeds. `scripts/weekly_check.py` (its own workflow, Sunday) makes that reconciliation routine:
+
+- **Feed health** runs the batch's own fetch and read-state code on a *copy* of `state.json` — the same warnings the batch would raise, plus a fetch of each URL-mode feed's newest article to catch challenge pages and empty (JavaScript-only) pages before they become junk sources.
+- **Reconciliation** needs to know what was aired. Run logs expire after 90 days and need API access, so the batch keeps its last 30 runs in `state.json` under `_runs` (`aired`, `skipped`, `blocked`, `first_run`). An RSS article published in the window (older than 24 h, so the next run has had its chance) that was neither aired, skipped as stale, nor blocked, and is not still waiting as unread, is reported as **not aired** — a loss nobody has explained yet. Sitemaps are left out: their dates are edit dates.
+- **Recall** (opt-in, `weekly_check.recall`) asks NotebookLM's Deep Research for the week's official announcements and sorts what it finds: aired, present in a feed (skipped or filtered), **on a followed site but in no feed** (a subscription gap — this is how `anthropic.com/claude-opus-5-5` would have surfaced), or elsewhere. It uses the CI credential the batch already has; the notebook it creates is titled with the topic `Recall` and falls under the ordinary full-match cleanup.
+
+The check never writes `state.json`, never generates audio, and is deterministic except for the Deep Research step, which only ever produces a list for a human to judge.
+
 ## Known weaknesses (and where they lead)
 
 Being honest about these is part of the design; each one points at a future improvement rather than hiding behind one.

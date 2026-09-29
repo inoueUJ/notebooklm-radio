@@ -61,7 +61,9 @@ An expired env-var credential makes the CLI exit **2 / `UNEXPECTED_ERROR`**, not
 |---|---|
 | 🎙️ article list | Episode generation **started** (not finished — audio is fire-and-forget). Each topic heading links to its notebook. A heading marked 音声は未生成 means the sources are in but no audio was started for that topic — see the separate error message. |
 | 😪 no news | The run worked; there was nothing new. Silence, by contrast, means breakage. |
-| ⚠️ feed warning | A feed failed to fetch/parse. Its read-state was left untouched. |
+| ⚠️ feed warning | A feed failed to fetch/parse (its read-state was left untouched), or a per-run check fired: every visible entry is unread (older ones may have scrolled out before being processed — raise the limits or use a narrower feed), links point at `#anchors` on one page (use `source_mode: text`), or a sitemap's URLs changed all at once (re-baselined, nothing aired). |
+| ⏭ skipped as stale | Articles older than `settings.max_age_hours`, marked read instead of aired. Listed so nothing disappears silently. |
+| 🗓 weekly check | Sunday: feed health, what aired versus what the feeds published (not aired, aired twice, still pending) and, with `weekly_check.recall`, the Deep Research sweep for announcements no feed carried. Two lines when all is well. A "not aired" article is a loss nobody has explained yet — worth a look. |
 | ⚠️ bot-protection notice | Articles whose content couldn't be ingested; they are *not* in the episode |
 | 🧹 cleanup report | What was (or in dry-run, would be) deleted; a 🧹 削除に失敗 line means cleanup failed and will retry next run |
 | 🚨 gate failure | The test/lint job failed, so the batch did not run at all. Fix the code; there is no episode until it is green. |

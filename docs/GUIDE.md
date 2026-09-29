@@ -193,6 +193,9 @@ Rules:
 | `Tech Radio 実行エラー発生` + `Authentication expired` | Credential expired | `python scripts/setup.py renew` |
 | `🚨 テスト/lint が失敗した` | Tests, lint or the config check failed (a bad config.yaml stops here, before the batch) | Open the linked run; it shows `config.yaml NG` and why. `--check-config` reproduces it locally |
 | `（音声は未生成）` + a message with `rate_limited` | Daily Audio Overview cap | Fewer notebooks, drop the second run, or a bigger plan. Sources are in the notebook; generate by hand if you like |
+| `⚠️ フィードに問題があるよ ・X: 表示されている N 件がすべて未読` | Processing fell behind; older articles may have scrolled out of the feed | Raise `settings.limits` or use a narrower feed |
+| `⚠️ フィードに問題があるよ ・X: … # 位置を指している` | Links are anchors on one page; by URL the whole page comes in | `source_mode: text` on that feed |
+| `🗓 週次点検` lists 流していない記事 | Articles the feeds published that were neither aired nor skipped | Worth investigating — possibly a new kind of loss |
 | `⚠️ フィードに問題があるよ ・X: HTTP 403` | That feed couldn't be fetched; its read-state was left alone | Transient: ignore. Persistent 403: the host refuses bots |
 | `⚠️ 以下はサイトのボット対策で本文を取り込めなかった` | Article pages were challenge pages | Add `source_mode: text` to that feed |
 | The same page several times in one notebook (e.g. three copies of "… changelog") | The feed links to `#anchors` on one page, and NotebookLM imports the whole page per entry | Add `source_mode: text` to that feed |

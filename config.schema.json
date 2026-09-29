@@ -40,6 +40,15 @@
         }
       }
     },
+    "weekly_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The weekly check (scripts/weekly_check.py, .github/workflows/weekly-check.yml) always reports feed health and aired-vs-published reconciliation. These keys add the optional Deep Research sweep.",
+      "properties": {
+        "recall": { "type": "boolean", "default": false, "description": "Once a week, let NotebookLM's Deep Research look for official announcements from the past 7 days and list those on sites you follow that no feed carried. Uses one Deep Research a week; the notebook it creates (topic 'Recall') is cleaned up like the others." },
+        "recall_query": { "type": "string", "minLength": 1, "description": "The question to research. {start} and {end} become the week's dates. Defaults to one built from the feed names." }
+      }
+    },
     "watch": {
       "type": "array",
       "description": "Notification-only page monitoring (never becomes radio). Watches a sitemap for new URLs and changed <lastmod> under a prefix.",

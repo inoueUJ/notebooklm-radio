@@ -1,0 +1,62 @@
+name: Weekly check
+
+# Once a week: feed health, a reconciliation of what was aired against what the
+# feeds published, and (with weekly_check.recall: true in config.yaml) a Deep
+# Research sweep for official announcements no feed carried. Posts one message.
+# Read-only for the repository: it never writes state.json.
+on:
+  schedule:
+    # Sunday 12:10 JST (times assume Asia/Tokyo, UTC+9). Not time-critical — GitHub
+    # may start it hours late — and far from the daily run, so the report is
+    # waiting on Monday morning.
+    - cron: '10 3 * * 0'
+  workflow_dispatch:       # manual runs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Deep Research takes 15–30 minutes; everything else takes about one.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Same reason as the batch: notebooklm-py runs in this process tree.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+
+      - name: Install notebooklm-py
+        run: |
+          # Only $HOME/.local/bin goes on PATH (see the batch workflow).
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          uv tool install "notebooklm-py[browser]==0.8.0"
+
+      - name: Verify environment
+        run: |
+          python -c "import feedparser, yaml, httpx; print('pip deps OK')"
+          command -v notebooklm
+
+      - name: Weekly check
+        env:
+          NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: python scripts/weekly_check.py

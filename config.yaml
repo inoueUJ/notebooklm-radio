@@ -91,6 +91,13 @@ feeds:
 #     prefix: "https://support.claude.com/en/articles/"
 #     keywords: [pricing, usage, limit]
 
+# The weekly check (.github/workflows/weekly-check.yml) reports feed health and what
+# aired versus what your feeds published. recall: true also lets NotebookLM's Deep
+# Research look for the week's official announcements that none of your feeds carried
+# (one Deep Research a week).
+# weekly_check:
+#   recall: true
+
 settings:
   # {topic} and {date} are filled in, e.g. "Tech Radio AI 2026-08-31".
   # Cleanup only ever deletes notebooks whose title FULLY matches this format,

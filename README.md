@@ -83,6 +83,7 @@ flowchart LR
 | `feeds[].type: sitemap` | RSS のないサイト向け。`sitemap.xml` を読み、`prefix` 配下の URL を記事として扱う。 |
 | `feeds[].source_mode: text` | 記事 URL を渡しても中身が正しく入らないフィード向け。ボット対策で NotebookLM の取得が弾かれるホストと、リンクが 1 ページ内の `#` 位置になっている変更履歴がこれにあたる(URL のままだとページ全体が毎回入る)。URL の代わりにフィードの配信内容をテキストとして入れる。本文が配信されていれば本文を、要約しかなければ「要約のみ」と明示して入れる。 |
 | `feeds[].categories` | RSS のカテゴリで記事を絞る。書いたカテゴリのどれかが付いた記事だけを拾う(大文字小文字は区別しない)。発表と会社の話題や導入事例が混ざるフィードで `[Product, Research]` のように使う。sitemap 型では無視される。 |
+| `weekly_check.recall` | 週次点検で NotebookLM の Deep Research を使い、どのフィードにも載っていなかった公式発表を探す(週 1 回)。問いは `recall_query` で変えられ、`{start}` `{end}` はその週の日付になる。 |
 | `feeds[].mode: latest` | アグリゲータのように流量の多いフィード向け。毎回最新の N 件だけ拾い、残りは意図的に既読にする。既定の backlog モードは古い順に消化して何も捨てない。 |
 | `topics.<name>.audio` | トピック別に音声設定を上書きする。`format`(deep-dive / brief / critique / debate)、`length`、`prompt`、`language`。 |
 | `settings.notebook_title_format` | 自動削除の対象は、この形式に完全一致するタイトルだけ。手で作ったノートブックには触らない。 |
@@ -100,6 +101,8 @@ flowchart LR
 認証は 3.5 週間ほどで切れます。切れると原因を書いたエラー通知が届くので、`python scripts/setup.py renew` を実行してください。詳しい手順は [docs/OPERATIONS.md](docs/OPERATIONS.md) にあります。
 
 新着がない日でも 😪 の通知は届くようにしてあります。通知が何も来ない日があったら、それは故障です。Actions タブを見てください。
+
+週に一度、日曜のお昼に 🗓 の点検結果が 1 通届きます。フィードがちゃんと取れているか、この 1 週間にフィードへ載った記事を流したか(流していない記事と二度流した記事)を数えたもので、問題がなければ 2 行で終わります。`config.yaml` に `weekly_check.recall: true` を書くと、NotebookLM の Deep Research にその週の公式発表を探させ、購読しているサイトの記事なのにどのフィードにも載っていなかったものも並べます。Deep Research を週に 1 回使います。
 
 音声の生成は「開始した」時点で成功扱いです。Google 側でレンダリングに失敗しても、実行は失敗になりません。生成の開始そのものに失敗したとき(ほとんどは NotebookLM の 1 日あたりの生成上限で、無料枠は 3 本です)は、記事はノートブックに入った状態のまま、原因を添えたエラー通知が別に届きます。その場合はアプリから手動で生成してください。
 

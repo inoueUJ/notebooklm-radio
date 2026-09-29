@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from types import SimpleNamespace
 from urllib.parse import urldefrag, urlparse
 from xml.etree import ElementTree
@@ -50,6 +51,14 @@ STALE_LIST_MAX = 10
 # sitemap で一度にこの件数（かつ全 URL の半分）を超えて未読になったら、記事が増えたのではなく
 # URL の形式が変わったとみなす（antigravity.google が 2026-09 に末尾の / を付け、全記事が新着に見えた）
 SITEMAP_REBASELINE_MIN = 5
+# フィードに見えている記事がこの件数以上あって全部未読なら、表示範囲から押し出された記事があるかもしれないと警告する
+# （2026-09 前半、GitHub Changelog は 10 件すべて未読のまま 30 回続き、152 件中 101 件を失っていた）
+WINDOW_WARN_MIN = 5
+# state.json に残す直近の実行記録の数。週 1 回の点検（scripts/weekly_check.py）が「何を流したか」を知るために使う
+RUNS_KEY = '_runs'
+MAX_RUN_HISTORY = 30
+# 週 1 回の取りこぼし検査（Deep Research）用のノートブックのトピック名。古くなったら掃除の対象にする
+RECALL_TOPIC = 'Recall'
 # feed に topic が指定されていない場合の行き先ノートブック（settings.default_topic で上書き可）
 DEFAULT_TOPIC = 'AI'
 
@@ -106,7 +115,8 @@ class ConfigError(ValueError):
 
 
 # config.yaml で受け付けるキー。config.schema.json（ビルダー用の型定義）と同じ規則。
-TOP_KEYS = {'feeds', 'topics', 'watch', 'settings'}
+TOP_KEYS = {'feeds', 'topics', 'watch', 'settings', 'weekly_check'}
+WEEKLY_CHECK_KEYS = {'recall', 'recall_query'}
 FEED_KEYS = {'name', 'url', 'type', 'prefix', 'topic', 'source_mode', 'mode', 'categories'}
 TOPIC_KEYS = {'audio'}
 WATCH_KEYS = {'name', 'url', 'prefix', 'keywords'}
@@ -224,6 +234,18 @@ def validate_config(config):
         topic = feed.get('topic', default_topic)
         if isinstance(topic, str):
             feed_topics.add(topic)
+
+    weekly = config.get('weekly_check')
+    if weekly is not None:
+        if not isinstance(weekly, dict):
+            errors.append('`weekly_check:` はマッピング（recall / recall_query）である必要がある')
+        else:
+            unknown(weekly.keys(), WEEKLY_CHECK_KEYS, 'weekly_check')
+            if 'recall' in weekly and not isinstance(weekly['recall'], bool):
+                errors.append('weekly_check.recall: true / false')
+            query = weekly.get('recall_query')
+            if 'recall_query' in weekly and not (isinstance(query, str) and query.strip()):
+                errors.append('weekly_check.recall_query: 空でない文字列')
 
     topics = config.get('topics')
     if topics is None:
@@ -864,6 +886,9 @@ def _notebook_title_patterns(config):
     # feeds[].topic に加えて topics: セクションの名前も候補にする（フィードを外した後も掃除できるように）
     topics = {f.get('topic', DEFAULT_TOPIC) for f in config.get('feeds', [])} | {DEFAULT_TOPIC}
     topics |= set((config.get('topics') or {}).keys())
+    # 週 1 回の取りこぼし検査が作るノートブック（Tech Radio Recall {date}）も、古くなれば同じ規則で消す
+    if (config.get('weekly_check') or {}).get('recall'):
+        topics.add(RECALL_TOPIC)
     topic_re = '(?:' + '|'.join(re.escape(t) for t in sorted(topics)) + ')'
 
     patterns = []
@@ -1367,6 +1392,28 @@ def check_rss_feeds(config, state, now=None):
         # 聞くためのラジオで、障害明けの溜まった記事や前日付で遅れて現れた記事を何日も後に流しても意味がない。
         # 「処理していない記事を既読にしない」の明示的な例外（mode: latest と同じ扱い）。見送った記事は
         # 既読にして Slack に一覧を出す（黙って消さない）。日付のない記事と sitemap は判定しない。
+        # 実行のたびの点検。どちらも設定か取りこぼしの問題なので、直るまで毎回知らせる
+        if not is_sitemap and not first_run and not latest_mode:
+            if len(entries) >= WINDOW_WARN_MIN and len(unread) == len(entries):
+                warnings.append(
+                    (
+                        name,
+                        f'表示されている {len(entries)} 件がすべて未読。これより古い記事は処理する前にフィードから'
+                        '消えたかもしれない（1 回の上限を上げるか、狭いフィードに替える）',
+                    )
+                )
+        if not is_sitemap and source_mode != TEXT_SOURCE_MODE:
+            pages = Counter(urldefrag(e['link']).url for e in entries if urldefrag(e['link']).fragment)
+            shared = sum(n for n in pages.values() if n >= 2)
+            if shared:
+                warnings.append(
+                    (
+                        name,
+                        f'{shared} 件の記事リンクが同じページの # 位置を指している。URL のままだとページ全体が毎回'
+                        '入るので、source_mode: text にする',
+                    )
+                )
+
         stale = []
         if MAX_AGE_HOURS and not is_sitemap:
             cutoff = now - datetime.timedelta(hours=MAX_AGE_HOURS)
@@ -1377,6 +1424,8 @@ def check_rss_feeds(config, state, now=None):
             # 初回と latest は残りを全部既読にする回なので、見送りとして数えない（通知もしない）
             result['skipped'] = stale
             print(f"[{name}] Skipping {len(stale)} article(s) older than {MAX_AGE_HOURS}h.")
+            for e in stale:
+                print(f"[{name}] Stale, not aired: {e['link']}")
 
         if first_run and is_sitemap:
             # sitemap の lastmod は「更新日」なので、どれが最新の記事かは決められない。lastmod 順で
@@ -1467,6 +1516,20 @@ def _advance_sitemap_state(state, result, processed_ids, now):
     state[key] = entry
     # 旧形式（URLキー + watermark）は移行済みなので掃除する
     state.pop(result['url'], None)
+
+
+def record_run(state, now, aired, skipped, blocked, first_runs):
+    """この回に流したもの・見送ったもの・取り込めなかったものを state に残す（直近 MAX_RUN_HISTORY 回）。
+
+    週 1 回の点検（scripts/weekly_check.py）が、フィードの中身と突き合わせて取りこぼしと二重放送を数えるために使う。
+    実行ログは 90 日で消え、取り出すにも API が要るので、読み取りだけで済む state に置く。
+    """
+    runs = state.get(RUNS_KEY)
+    runs = runs if isinstance(runs, list) else []
+    runs.append(
+        {'at': now.isoformat(), 'aired': aired, 'skipped': skipped, 'blocked': blocked, 'first_run': first_runs}
+    )
+    state[RUNS_KEY] = runs[-MAX_RUN_HISTORY:]
 
 
 def advance_state(state, feed_results, processed, now=None):
@@ -1647,10 +1710,15 @@ def main():
         # 鮮度の足切りで見送った記事（黙って消さず、一覧を知らせる）
         send_stale_notification(webhook_url, [e for r in feed_results for e in r.get('skipped', [])])
 
+        run_at = datetime.datetime.now(UTC)
+        stale_links = [e['link'] for r in feed_results for e in r.get('skipped', [])]
+        first_runs = [r['name'] for r in feed_results if r['first_run']]
+
         if not candidates:
             print("No new articles detected.")
             send_no_news_notification(webhook_url)
             advance_state(state, feed_results, [])
+            record_run(state, run_at, [], stale_links, [], first_runs)
             save_state(state)
             run_maintenance(config, state, webhook_url)
             return
@@ -1718,6 +1786,7 @@ def main():
 
         # 5. 状態保存（処理できたトピックの記事の分だけ既読を進める。失敗分は次回に持ち越す）
         advance_state(state, feed_results, processed)
+        record_run(state, run_at, [a['link'] for a in listed], stale_links, sorted(blocked_urls), first_runs)
         save_state(state)
 
         # 6. メンテナンス（古いラジオの削除・停滞フィード検知。失敗しても本体は成功扱い）
