@@ -70,6 +70,10 @@ def reconcile(runs, results, now):
     流していない = 期間内（直近 24 時間を除く）に公開され、流した・見送った・取り込めなかったのどれでもなく、
     まだ未読で待っているのでもない記事。新しく足したフィードの初回分は既読化が仕様なので除く。
     """
+    # 記録がある期間だけを見る。記録を取り始める前に流した記事を「流していない」と数えないため
+    if not runs:
+        return {'aired': set(), 'skipped': 0, 'duplicates': [], 'missed': [], 'pending': [], 'no_history': True}
+    start = max(now - WINDOW, min(datetime.datetime.fromisoformat(r['at']) for r in runs))
     aired_per_run = [{norm(u) for u in r.get('aired', [])} for r in runs]
     aired = set().union(*aired_per_run)
     accounted = aired | {norm(u) for r in runs for u in [*r.get('skipped', []), *r.get('blocked', [])]}
@@ -83,7 +87,7 @@ def reconcile(runs, results, now):
         threshold = rb.read_threshold(result['watermark'], result.get('floor'))
         recent = set(result['recent_ids'])
         for e in result['entries']:
-            if e['ts'] is None or not (now - WINDOW <= e['ts'] <= now - SETTLE):
+            if e['ts'] is None or not (start <= e['ts'] <= now - SETTLE):
                 continue
             if norm(e['link']) in accounted:
                 continue
@@ -97,6 +101,7 @@ def reconcile(runs, results, now):
         'duplicates': sorted(u for u, n in twice.items() if n >= 2),
         'missed': missed,
         'pending': pending,
+        'no_history': False,
     }
 
 
@@ -244,12 +249,22 @@ def _link(url, title, is_discord):
 
 def build_message(period, feed_total, warnings, article_problems, recon, recall, is_discord):
     """週次点検の通知文。問題がなければ短く、あるときだけ中身を並べる。"""
+    if recon.get('no_history'):
+        lines = [f"🗓 週次点検（{period}）", '突き合わせは、実行記録がたまる次回から']
+        lines += _problem_lines(warnings, article_problems, recon, recall, is_discord)
+        return '\n'.join(lines)
     lines = [
         f"🗓 週次点検（{period}）",
         f"流した {len(recon['aired'])} 本・鮮度で見送り {recon['skipped']} 本・二重 {len(recon['duplicates'])} 本・"
         f"流していない {len(recon['missed'])} 本・待ち {len(recon['pending'])} 本／"
         f"フィード {feed_total - len({n for n, _ in warnings if n})} / {feed_total} 本が問題なし",
     ]
+    lines += _problem_lines(warnings, article_problems, recon, recall, is_discord)
+    return '\n'.join(lines)
+
+
+def _problem_lines(warnings, article_problems, recon, recall, is_discord):
+    lines = []
     if warnings:
         lines.append('⚠️ フィードの警告')
         lines += [f"・{name}: {reason}" for name, reason in warnings[:LIST_MAX]]
@@ -278,7 +293,7 @@ def build_message(period, feed_total, warnings, article_problems, recon, recall,
             if others:
                 top = '、'.join(f"{site} {n}" for site, n in others.most_common(5))
                 lines.append(f"購読していないサイト {len(recall['elsewhere'])} 件（{top}）")
-    return '\n'.join(lines)
+    return lines
 
 
 def main():

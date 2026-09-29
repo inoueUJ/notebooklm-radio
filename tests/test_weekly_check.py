@@ -74,6 +74,20 @@ def test_reconcile_ignores_new_feeds_blocked_articles_and_sitemaps():
     assert recon['missed'] == [] and recon['pending'] == []
 
 
+def test_reconcile_only_covers_the_recorded_period():
+    """記録を取り始める前に流した記事を「流していない」と数えない（初回の週次点検）。"""
+    before_history = entry(1, NOW - 5 * DAY)
+    after_start = entry(2, NOW - 2 * DAY)
+    runs = [{'at': (NOW - 3 * DAY).isoformat(), 'aired': []}]
+    recon = wc.reconcile(runs, [rss_result([before_history, after_start], recent_ids=['id-1', 'id-2'])], NOW)
+    assert [e['title'] for e in recon['missed']] == ['記事2']
+
+    empty = wc.reconcile([], [rss_result([after_start], recent_ids=['id-2'])], NOW)
+    assert empty['no_history'] and empty['missed'] == []
+    text = wc.build_message('p', 20, [], [], empty, None, is_discord=False)
+    assert '次回から' in text
+
+
 def test_classify_found_separates_gaps_from_what_was_aired_or_is_in_feeds():
     found = [
         {'url': 'https://www.anthropic.com/news/aired#x', 'title': 'aired'},
@@ -103,7 +117,7 @@ def test_build_query_default_and_custom():
 
 
 def empty_recon():
-    return {'aired': {'a', 'b'}, 'skipped': 0, 'duplicates': [], 'missed': [], 'pending': []}
+    return {'aired': {'a', 'b'}, 'skipped': 0, 'duplicates': [], 'missed': [], 'pending': [], 'no_history': False}
 
 
 def test_message_is_short_when_all_is_well():
