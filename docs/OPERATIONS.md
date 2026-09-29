@@ -96,6 +96,8 @@ The design rationale in this repo is earned. Dates preserved from the original p
 
 **2026-09 — re-dated articles aired twice.** Vercel re-dated an edited post, which re-crossed the watermark and aired again three days later; Claude Code's what's-new feed changed an old week's date (and its content-hash GUID) and aired it as new. Fix: every processed ID is remembered (the what's-new feed also moved to per-week pages read from the sitemap).
 
+**2026-09-29 — the trailing slash.** antigravity.google changed its sitemap URLs to end in `/`. None matched the stored seen-set, so all 24 posts looked new, one old post aired, and the seen-set was overwritten with the single aired URL. The feed was paused the same day. Fix: seen-set comparison ignores a trailing slash, and a sitemap where more than half the URLs turn unread at once is re-baselined with a warning instead of aired.
+
 **2026-09 — anchor-linked changelogs imported whole pages.** The Codex changelog links every entry to a `#fragment` of one ~1.4 MB page; NotebookLM imports the page, so 42 adds in a month were 21+ copies of the entire history (three in one notebook). Fix: `source_mode: text` submits each entry's own text, labeled as the feed's body rather than as a summary.
 
 **2026-09 — audio failure left articles unread.** If `generate audio` failed after the sources were added, the topic counted as failed and its articles stayed unread, so the next run re-added the same URLs. Fix: those articles are marked read and the failure is reported separately with the CLI's error code, so a daily-quota rejection (`rate_limited`) is visible instead of an opaque exit code.

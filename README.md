@@ -88,6 +88,7 @@ flowchart LR
 | `settings.notebook_title_format` | 自動削除の対象は、この形式に完全一致するタイトルだけ。手で作ったノートブックには触らない。 |
 | `settings.timezone` | ノートブックの日付と月次判定の基準。runner は UTC なので必ず自分のタイムゾーンを入れる。 |
 | `settings.limits` | 1 回に処理する記事数。超えた分は捨てずに次回へ持ち越す。 |
+| `settings.max_age_hours` | 公開からこの時間を過ぎた記事は流さずに既読にし、Slack に一覧だけ出す(既定は無効)。朝に最新のニュースだけを聞きたいときに、障害明けの溜まった記事や遅れて現れた記事が何日も後に流れるのを防ぐ。 |
 | `settings.audio` | 全体の音声設定。`format`、`length`、`prompt`、`scope`(既定の `run` はその回に入れた記事だけで 1 本。`notebook` にするとその日のノートブック全体)。 |
 | `settings.cleanup` | 古い日次ノートブックの自動削除。初期状態は `dry_run: true` で、削除予定の一覧が正しいことを確かめてから false にする。 |
 | `watch:` | 通知だけのページ監視。ラジオにはしない。 |

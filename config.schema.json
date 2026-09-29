@@ -83,7 +83,8 @@
             "legacy_title_formats": { "type": "array", "items": { "type": "string", "pattern": "\\{date\\}" }, "description": "Retired title formats whose notebooks should still be cleaned up." }
           }
         },
-        "stale_feed_days": { "type": "integer", "minimum": 1, "default": 30, "description": "On the 1st of each month, report feeds with no new articles for this many days." }
+        "stale_feed_days": { "type": "integer", "minimum": 1, "default": 30, "description": "On the 1st of each month, report feeds with no new articles for this many days." },
+        "max_age_hours": { "type": "integer", "minimum": 1, "description": "Do not air articles published more than this many hours ago: mark them read and list them in one notification. Off when absent. Applies to dated RSS/Atom entries (sitemaps and undated entries are never considered stale); a feed's first run never counts as skipping." }
       }
     }
   },

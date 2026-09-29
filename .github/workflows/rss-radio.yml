@@ -5,6 +5,10 @@ on:
     # Pick times that fit YOUR morning (times below assume Asia/Tokyo, UTC+9):
     # the morning run collects announcements published overnight, early enough
     # that audio generation (~20 min) finishes before you start listening.
+    # GitHub starts scheduled runs late when it is busy, sometimes by hours: since
+    # 2026-09 the author's runs have started 1.5–2.5 h late in the JST early morning
+    # and 3.5–8.5 h late in the JST afternoon. Schedule well before you listen; an
+    # on-time start is merely early. A manual run (workflow_dispatch) is not delayed.
     # Avoid :00/:30 exactly — GitHub's cron is congested there and runs get delayed.
     - cron: '50 21 * * *'  # 06:50 JST — catches overnight (US daytime) announcements
     - cron: '15 8 * * *'   # 17:15 JST — catches JP/EU daytime announcements

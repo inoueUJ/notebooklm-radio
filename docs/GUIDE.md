@@ -152,6 +152,7 @@ Everything is in `config.yaml`. Commit and push; the next run picks it up (a pus
 | Instructions for every show | `settings.audio.prompt` |
 | Run times | The two `- cron:` lines in `.github/workflows/rss-radio.yml` (UTC); the builder's `cron` tab converts |
 | Articles per run | `settings.limits.per_feed` (default 3) and `total` (default 15). Overflow carries over, never dropped |
+| Don't air stale news | `settings.max_age_hours` (e.g. 72). Older articles are marked read and listed in Slack |
 | A firehose feed | `mode: latest` on that feed |
 | A feed that mixes in off-topic posts | `categories: [...]` on that feed (keeps items tagged with those RSS categories) |
 | Audio language | `settings.language` |
@@ -192,7 +193,7 @@ Rules:
 | `Tech Radio 実行エラー発生` + `Authentication expired` | Credential expired | `python scripts/setup.py renew` |
 | `🚨 テスト/lint が失敗した` | Tests, lint or the config check failed (a bad config.yaml stops here, before the batch) | Open the linked run; it shows `config.yaml NG` and why. `--check-config` reproduces it locally |
 | `（音声は未生成）` + a message with `rate_limited` | Daily Audio Overview cap | Fewer notebooks, drop the second run, or a bigger plan. Sources are in the notebook; generate by hand if you like |
-| `⚠️ RSSフィードの取得に問題があるよ ・X: HTTP 403` | That feed couldn't be fetched; its read-state was left alone | Transient: ignore. Persistent 403: the host refuses bots |
+| `⚠️ フィードに問題があるよ ・X: HTTP 403` | That feed couldn't be fetched; its read-state was left alone | Transient: ignore. Persistent 403: the host refuses bots |
 | `⚠️ 以下はサイトのボット対策で本文を取り込めなかった` | Article pages were challenge pages | Add `source_mode: text` to that feed |
 | The same page several times in one notebook (e.g. three copies of "… changelog") | The feed links to `#anchors` on one page, and NotebookLM imports the whole page per entry | Add `source_mode: text` to that feed |
 | `😪 今回は新着なし` every time | Genuinely quiet, or `feeds:` is empty | `--check-config` prints the feed count |

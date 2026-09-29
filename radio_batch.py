@@ -41,6 +41,15 @@ MAX_RECENT_IDS = 200
 LOOKBACK = datetime.timedelta(days=7)
 # sitemap の記事はフィードから押し出されない（毎回全 URL が返る）。全体上限の並べ替えで最後に回す
 NEVER_SCROLLS_OUT = 10**9
+# 鮮度の足切り（settings.max_age_hours で指定。既定は無効）。公開からこの時間を過ぎた記事は流さずに既読にし、
+# Slack に一覧だけ出す。朝に整理された最新情報を聞くためのラジオで、障害明けに 2 週間前のニュースを流して
+# いた（2026-09 前半、公開から放送まで中央値 14.5 日）ことへの対策。
+MAX_AGE_HOURS = None
+# 見送った記事の通知に並べる件数（障害明けは多くなるので先頭だけ）
+STALE_LIST_MAX = 10
+# sitemap で一度にこの件数（かつ全 URL の半分）を超えて未読になったら、記事が増えたのではなく
+# URL の形式が変わったとみなす（antigravity.google が 2026-09 に末尾の / を付け、全記事が新着に見えた）
+SITEMAP_REBASELINE_MIN = 5
 # feed に topic が指定されていない場合の行き先ノートブック（settings.default_topic で上書き可）
 DEFAULT_TOPIC = 'AI'
 
@@ -80,7 +89,7 @@ def apply_settings_overrides(config):
     テストは各関数を直接呼ぶ（main を通らない）ので、既定値がそのまま使われる。
     上書き対象を増やしたら README の設定リファレンスも更新すること。
     """
-    global LOCAL_TZ, DEFAULT_TOPIC, MAX_ARTICLES_PER_FEED, MAX_ARTICLES_TOTAL, USER_AGENT
+    global LOCAL_TZ, DEFAULT_TOPIC, MAX_ARTICLES_PER_FEED, MAX_ARTICLES_TOTAL, USER_AGENT, MAX_AGE_HOURS
     settings = (config or {}).get('settings') or {}
     if settings.get('timezone'):
         LOCAL_TZ = ZoneInfo(settings['timezone'])
@@ -89,6 +98,7 @@ def apply_settings_overrides(config):
     MAX_ARTICLES_PER_FEED = int(limits.get('per_feed', MAX_ARTICLES_PER_FEED))
     MAX_ARTICLES_TOTAL = int(limits.get('total', MAX_ARTICLES_TOTAL))
     USER_AGENT = settings.get('user_agent', USER_AGENT)
+    MAX_AGE_HOURS = settings.get('max_age_hours', MAX_AGE_HOURS)
 
 
 class ConfigError(ValueError):
@@ -110,6 +120,7 @@ SETTINGS_KEYS = {
     'audio',
     'cleanup',
     'stale_feed_days',
+    'max_age_hours',
 }
 LIMITS_KEYS = {'per_feed', 'total'}
 AUDIO_KEYS = {'length', 'format', 'prompt', 'scope', 'language'}
@@ -291,6 +302,8 @@ def validate_config(config):
             errors.append('settings.cleanup.legacy_title_formats: {date} を含む文字列のリスト')
     if 'stale_feed_days' in settings and not _positive_int(settings['stale_feed_days']):
         errors.append('settings.stale_feed_days: 1 以上の整数')
+    if 'max_age_hours' in settings and not _positive_int(settings['max_age_hours']):
+        errors.append('settings.max_age_hours: 1 以上の整数（時間）')
 
     if errors:
         raise ConfigError('config.yaml に問題がある:\n' + '\n'.join(f"・{e}" for e in errors))
@@ -755,9 +768,31 @@ def send_feed_warning(webhook_url, warnings):
 
     is_discord = "discord.com" in webhook_url
     lines = "\n".join(f"・{name}: {reason}" for name, reason in warnings)
-    text = f"⚠️ RSSフィードの取得に問題があるよ\n{lines}"
+    text = f"⚠️ フィードに問題があるよ\n{lines}"
     payload = {"content": text} if is_discord else {"text": text}
     _post_webhook(webhook_url, payload, 'Feed warning')
+
+
+def send_stale_notification(webhook_url, articles):
+    """鮮度の足切り（settings.max_age_hours）で流さなかった記事を知らせる。
+
+    黙って消さない。読みたければ辿れるように題名とリンクを出す（障害明けは多いので先頭だけ）。
+    """
+    if not webhook_url or not articles:
+        return
+    unique = list({a['link']: a for a in sorted(articles, key=lambda a: a['ts'] or EPOCH, reverse=True)}.values())
+    shown = unique[:STALE_LIST_MAX]
+    is_discord = 'discord.com' in webhook_url
+    if is_discord:
+        lines = '\n'.join(f"・{a['title']}（{a['feed_name']}）\n  {a['link']}" for a in shown)
+    else:
+        lines = '\n'.join(f"・<{a['link']}|{a['title']}>（{a['feed_name']}）" for a in shown)
+    more = f"\n…ほか {len(unique) - len(shown)} 件" if len(unique) > len(shown) else ''
+    text = (
+        f"⏭ 公開から {MAX_AGE_HOURS} 時間以上たっていたので、ラジオには入れずに既読にしたよ（{len(unique)}件）\n"
+        f"{lines}{more}"
+    )
+    _post_webhook(webhook_url, {'content': text} if is_discord else {'text': text}, 'Stale notification')
 
 
 def send_error_notification(webhook_url, error_message, notebook_title=None):
@@ -1128,6 +1163,15 @@ def feed_state_key(feed_cfg):
     return feed_cfg['url']
 
 
+def normalize_url(url):
+    """sitemap の既読照合に使う形。末尾の / の有無だけで別の記事にしない。
+
+    antigravity.google は 2026-09 に記事 URL の末尾へ / を付けた。既読集合と 1 件も一致しなくなり、
+    全 24 記事が新着に見えて古い記事が再放送された。
+    """
+    return url.rstrip('/')
+
+
 def read_sitemap_state(state, key, legacy_url, entries):
     """sitemap 型フィードの既読URL集合を返す。(seen or None, 移行したか)。None は真の初回。
 
@@ -1136,13 +1180,13 @@ def read_sitemap_state(state, key, legacy_url, entries):
     """
     raw = state.get(key)
     if isinstance(raw, dict) and 'seen' in raw:
-        return set(raw['seen']), False
+        return {normalize_url(u) for u in raw['seen']}, False
 
     legacy = state.get(legacy_url)
     if isinstance(legacy, dict) and legacy.get('watermark'):
         watermark = datetime.datetime.fromisoformat(legacy['watermark'])
         recent = set(legacy.get('recent_ids', []))
-        seen = {e['id'] for e in entries if e['id'] in recent or (e['ts'] and e['ts'] <= watermark)}
+        seen = {normalize_url(e['id']) for e in entries if e['id'] in recent or (e['ts'] and e['ts'] <= watermark)}
         print(f"Migrating legacy watermark state to a seen-set ({len(seen)} read) for {key}.")
         return seen, True
 
@@ -1205,8 +1249,9 @@ def is_unread(entry_id, ts, threshold, recent_ids):
     return ts >= threshold
 
 
-def check_rss_feeds(config, state):
+def check_rss_feeds(config, state, now=None):
     """(candidates, feed_results, warnings) を返す。state はまだ変更しない。"""
+    now = now or datetime.datetime.now(UTC)
     candidates = []
     feed_results = []
     warnings = []
@@ -1275,7 +1320,7 @@ def check_rss_feeds(config, state):
             # 4月の記事が7月の修正で「新着」に化けるので、lastmod は新着判定に使わない。
             seen, _migrated = read_sitemap_state(state, key, url, entries)
             first_run = seen is None
-            unread = entries if first_run else [e for e in entries if e['id'] not in seen]
+            unread = entries if first_run else [e for e in entries if normalize_url(e['id']) not in seen]
             result = {
                 'name': name,
                 'url': url,
@@ -1318,6 +1363,21 @@ def check_rss_feeds(config, state):
         latest_mode = feed_cfg.get('mode') == 'latest' and not is_sitemap
         result['latest'] = latest_mode
 
+        # 鮮度の足切り（settings.max_age_hours）: 公開から時間が経ちすぎた記事は流さない。朝に最新情報を
+        # 聞くためのラジオで、障害明けの溜まった記事や前日付で遅れて現れた記事を何日も後に流しても意味がない。
+        # 「処理していない記事を既読にしない」の明示的な例外（mode: latest と同じ扱い）。見送った記事は
+        # 既読にして Slack に一覧を出す（黙って消さない）。日付のない記事と sitemap は判定しない。
+        stale = []
+        if MAX_AGE_HOURS and not is_sitemap:
+            cutoff = now - datetime.timedelta(hours=MAX_AGE_HOURS)
+            stale = [e for e in unread if e['ts'] is not None and e['ts'] < cutoff]
+            if stale:
+                unread = [e for e in unread if e['ts'] is None or e['ts'] >= cutoff]
+        if stale and not first_run and not latest_mode:
+            # 初回と latest は残りを全部既読にする回なので、見送りとして数えない（通知もしない）
+            result['skipped'] = stale
+            print(f"[{name}] Skipping {len(stale)} article(s) older than {MAX_AGE_HOURS}h.")
+
         if first_run and is_sitemap:
             # sitemap の lastmod は「更新日」なので、どれが最新の記事かは決められない。lastmod 順で
             # 1 件選ぶと、編集されただけの古いページや記事でないページを流してしまう
@@ -1327,6 +1387,19 @@ def check_rss_feeds(config, state):
             print(
                 f"[{name}] First run: marking all {len(entries)} URLs as read (a sitemap cannot tell which is newest)."
             )
+        elif is_sitemap and len(unread) > max(SITEMAP_REBASELINE_MIN, len(entries) // 2):
+            # 一度に半分以上の URL が未読 = 記事が増えたのではなく URL の形式が変わった（末尾の /、
+            # 言語パスの付け替え等）。流すと古い記事の再放送になるので、既読を今の URL で付け直す
+            picked = []
+            result['rebaseline'] = True
+            warnings.append(
+                (
+                    name,
+                    f'URL {len(entries)} 件のうち {len(unread)} 件が一度に未読になった。URL の形式が変わったとみなし、'
+                    '流さずに既読を付け直した',
+                )
+            )
+            print(f"[{name}] {len(unread)}/{len(entries)} URLs look new at once: re-baselining instead of airing.")
         elif first_run:
             # 初回は最新1件だけ処理し、残りは既読にする（過去記事の洪水を防ぐ）
             picked = unread[-1:]
@@ -1370,11 +1443,11 @@ def check_rss_feeds(config, state):
 
 def _advance_sitemap_state(state, result, processed_ids, now):
     """sitemap 型の既読URL集合を進める。処理できなかった未読は集合に入れず持ち越す。"""
-    current_ids = {e['id'] for e in result['entries']}
-    picked_here = current_ids & processed_ids
+    current_ids = {normalize_url(e['id']) for e in result['entries']}
+    picked_here = current_ids & {normalize_url(i) for i in processed_ids}
 
-    if result['first_run']:
-        seen = current_ids  # 初回は全既読（最新1件だけ処理済み）
+    if result['first_run'] or result.get('rebaseline'):
+        seen = current_ids  # 初回・URL 形式の付け替え時は、今の URL をすべて既読にする
     else:
         # sitemap から消えたURLは追跡をやめる（集合が sitemap のサイズを超えて肥大しない）
         seen = (result['seen'] | picked_here) & current_ids
@@ -1423,11 +1496,13 @@ def advance_state(state, feed_results, processed, now=None):
         if mark_all:
             dated = [e['ts'] for e in entries if e['ts']]
         else:
-            if not picked:
+            # 鮮度の足切りで見送った記事も「読み終えた」扱いにする（次回また見送り通知を出さない）
+            consumed = picked + [e for e in result.get('skipped', []) if e not in picked]
+            if not consumed:
                 continue  # このフィードからは何も処理していない → 変更なし
             # 日付なしの記事しか処理しなかった場合も、既読(recent_ids)の記録は必要。
             # その場合 dated が空なので透かしは進めず維持する。
-            dated = [e['ts'] for e in picked if e['ts']]
+            dated = [e['ts'] for e in consumed if e['ts']]
 
         # 透かしは戻さない（フィードが縮んでも）。未来日付の記事では「今」より先へ進めない:
         # 誤った日付 1 件で透かしが未来へ飛ぶと、その日までの記事が全部既読扱いになる。
@@ -1447,8 +1522,8 @@ def advance_state(state, feed_results, processed, now=None):
             # 処理した記事は時刻に関係なく ID で覚える（公開時刻が後から動いても再放送しない）。
             # 記録するのは「処理した」ものだけ。未処理の分まで載せると、持ち越したはずの記事や
             # 前日付で差し込まれた記事が既読扱いで消える。is_unread が振り返り範囲を未読に倒して
-            # いるのは、このリストが処理済みの ID を正確に持つことが前提。
-            recorded = [e['id'] for e in picked]
+            # いるのは、このリストが処理済みの ID を正確に持つことが前提（見送りは意図的な既読なので載せる）。
+            recorded = [e['id'] for e in consumed]
 
         merged = list(dict.fromkeys([*result['recent_ids'], *recorded]))
         kept = merged[-MAX_RECENT_IDS:]
@@ -1569,6 +1644,8 @@ def main():
 
         if warnings:
             send_feed_warning(webhook_url, warnings)
+        # 鮮度の足切りで見送った記事（黙って消さず、一覧を知らせる）
+        send_stale_notification(webhook_url, [e for r in feed_results for e in r.get('skipped', [])])
 
         if not candidates:
             print("No new articles detected.")

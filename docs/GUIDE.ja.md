@@ -150,6 +150,7 @@ webhook URL の取り方:
 | 全番組共通の指示文 | `settings.audio.prompt` |
 | 実行時刻 | `.github/workflows/rss-radio.yml` の `- cron:` 2 行(UTC)。ビルダーの `cron` タブが変換してくれる |
 | 1 回に処理する記事数 | `settings.limits.per_feed`(フィードごと、既定 3)と `total`(全体、既定 15)。超えた分は捨てずに次回へ |
+| 古いニュースは流さない | `settings.max_age_hours`(例: 72)。超えた記事は既読にして Slack に一覧だけ出す |
 | 流量の多いフィード | そのフィードに `mode: latest`(最新 N 件だけ拾い、残りは読んだことにする) |
 | 関係ない話題が混ざるフィード | そのフィードに `categories: [...]`(RSS のカテゴリ名で絞る) |
 | 音声の言語 | `settings.language`(ja / en など) |
@@ -194,7 +195,7 @@ python scripts/setup.py renew
 | `Tech Radio 実行エラー発生` + `Authentication expired` | 認証切れ | `python scripts/setup.py renew` |
 | `🚨 テスト/lint が失敗した` | テスト・lint・config.yaml の検査で止まった(config.yaml の誤りは本体まで届かず、ここで止まる) | リンク先の実行ログを見る。`config.yaml NG` と原因が出ている。`--check-config` で手元でも確認できる |
 | 見出しに `（音声は未生成）` + 別通知に `rate_limited` | その日の音声上限に当たった | ノートブックを減らす、2 回目の実行を切る、プランを上げる。記事はノートブックに入っているので、アプリから手動生成もできる |
-| `⚠️ RSSフィードの取得に問題があるよ ・X: HTTP 403` | そのフィードが取れない。既読状態は触っていない | 一時的なら放置。続くならフィード URL を見直す。403 が続くならボット拒否 |
+| `⚠️ フィードに問題があるよ ・X: HTTP 403` | そのフィードが取れない。既読状態は触っていない | 一時的なら放置。続くならフィード URL を見直す。403 が続くならボット拒否 |
 | `⚠️ 以下はサイトのボット対策で本文を取り込めなかった` | 記事ページがボット対策ページだった | そのフィードに `source_mode: text` を付ける |
 | 同じページが 1 冊に何度も入る(「… changelog」が 3 つなど) | フィードのリンクが 1 ページ内の `#` 位置で、NotebookLM が項目ごとにページ全体を取り込んでいる | そのフィードに `source_mode: text` を付ける |
 | `😪 今回は新着なし` が毎回 | 本当に新着が無いか、`feeds:` が空 | `--check-config` の出力にフィード数が出る |

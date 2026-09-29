@@ -313,6 +313,71 @@ def test_future_dated_entry_does_not_push_watermark_past_now(feed_box):
     assert run_once(state, feed_box)[0] == []  # 未来日付の記事自体も、処理済み ID で既読のまま
 
 
+# --- 鮮度の足切り（settings.max_age_hours） ------------------------------------
+
+
+def test_stale_articles_are_skipped_recorded_and_reported_once(feed_box, monkeypatch):
+    """朝に最新情報を聞くラジオなので、公開から時間が経ちすぎた記事は流さない。
+    見送った記事は既読にして一度だけ知らせる（次回また見送り通知を出さない）。"""
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    first, results, _ = rb.check_rss_feeds(CONFIG, state, now=BASE + DAY)  # 初回（透かしは BASE）
+    rb.advance_state(state, results, rb.select_articles(first), now=BASE + DAY)
+
+    # 障害明けなどで 10 日後に見ると、4 日前の記事（振り返り範囲内だが 72 時間超）と 1 日前の記事がある
+    now = BASE + 10 * DAY
+    feed_box['feed'] = feed_of((1, BASE), (2, now - 4 * DAY), (3, now - DAY))
+    candidates, results, _ = rb.check_rss_feeds(CONFIG, state, now=now)
+    assert [a['title'] for a in candidates] == ['記事3']
+    assert [e['title'] for e in results[0]['skipped']] == ['記事2']
+    rb.advance_state(state, results, rb.select_articles(candidates), now=now)
+
+    candidates, results, _ = rb.check_rss_feeds(CONFIG, state, now=now)
+    assert candidates == [] and not results[0].get('skipped')
+
+
+def test_first_run_does_not_air_a_stale_latest(feed_box, monkeypatch):
+    """新しく足したフィードの最新記事が古ければ、初回でも流さない（MCP ブログの 5 週間前の記事）。"""
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    now = BASE + 40 * DAY
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY))
+    candidates, results, _ = rb.check_rss_feeds(CONFIG, {}, now=now)
+    assert candidates == [] and not results[0].get('skipped')  # 初回の既読化は見送りとして数えない
+
+
+def test_dateless_entries_are_never_stale(feed_box, monkeypatch):
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    feed_box['feed'] = rb.SimpleNamespace(entries=[FakeEntry(1)])
+    state = {}
+    run_once(state, feed_box)
+    feed_box['feed'].entries.append(FakeEntry(2))
+    assert run_once(state, feed_box)[0] == ['記事2']
+
+
+def test_stale_notification_lists_newest_first_and_caps(monkeypatch):
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    arts = [
+        {'title': f't{i}', 'link': f'https://e.example/{i}', 'feed_name': 'F', 'ts': BASE + i * HOUR}
+        for i in range(rb.STALE_LIST_MAX + 3)
+    ]
+    rb.send_stale_notification('https://hooks.slack.com/x', arts + arts[:1])  # 同じ URL は 1 回だけ
+
+    text = posted[0]['text']
+    assert '72 時間' in text and f'（{rb.STALE_LIST_MAX + 3}件）' in text
+    assert text.index(f't{rb.STALE_LIST_MAX + 2}') < text.index('t3')  # 新しい順
+    assert 'ほか 3 件' in text
+
+
+def test_validate_max_age_hours():
+    base = {'feeds': [{'name': 'A', 'url': 'https://a.example/feed'}]}
+    assert rb.validate_config({**base, 'settings': {'max_age_hours': 72}}) == []
+    with pytest.raises(rb.ConfigError, match='max_age_hours'):
+        rb.validate_config({**base, 'settings': {'max_age_hours': 0}})
+
+
 def test_many_same_timestamp_entries_do_not_oscillate(feed_box):
     """同時刻の ID は recent_ids の上限で溢れても未読に戻らない。"""
     feed_box['feed'] = same_day_feed(range(1, rb.MAX_RECENT_IDS + 51))
@@ -646,6 +711,50 @@ def test_sitemap_feeds_sharing_url_have_independent_state(monkeypatch):
         b'<url><loc>https://example.com/eng/older-than-news</loc><lastmod>2026-07-05T00:00:00Z</lastmod></url></urlset>',
     )
     assert sitemap_run(SHARED_CONFIG, state) == ['https://example.com/eng/older-than-news']
+
+
+def test_sitemap_trailing_slash_change_is_not_news(monkeypatch):
+    """URL の末尾に / が付いただけの記事を新着にしない（antigravity.google、2026-09）。"""
+    box = {'content': SITEMAP_XML}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+    state = {}
+    sitemap_run(SITEMAP_CONFIG, state)  # 初回
+
+    box['content'] = SITEMAP_XML.replace(b'hello-world</loc>', b'hello-world/</loc>').replace(
+        b'no-date</loc>', b'no-date/</loc>'
+    )
+    assert sitemap_run(SITEMAP_CONFIG, state) == []
+
+
+def test_sitemap_seen_saved_with_trailing_slash_still_matches(monkeypatch):
+    """正規化を入れる前に / 付きで保存された既読集合（Antigravity の 2026-09-29 時点の state）とも一致させる。"""
+    box = {'content': SITEMAP_XML}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+    key = 'sitemap:https://example.com/sitemap.xml:https://example.com/news/'
+    state = {key: {'seen': ['https://example.com/news/hello-world/', 'https://example.com/news/no-date/']}}
+    assert sitemap_run(SITEMAP_CONFIG, state) == []
+
+
+def sitemap_of(paths):
+    urls = ''.join(f'<url><loc>https://example.com/news/{p}</loc></url>' for p in paths)
+    return f'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>'.encode()
+
+
+def test_sitemap_mass_url_change_is_rebaselined_with_a_warning(monkeypatch):
+    """半分以上の URL が一度に未読 = URL の形式が変わった。流さずに既読を付け直し、警告を出す。"""
+    box = {'content': sitemap_of(f'post-{i}' for i in range(12))}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+    state = {}
+    sitemap_run(SITEMAP_CONFIG, state)
+
+    box['content'] = sitemap_of(f'2026/post-{i}' for i in range(12))  # 全記事の URL が付け替わる
+    candidates, results, warnings = rb.check_rss_feeds(SITEMAP_CONFIG, state)
+    rb.advance_state(state, results, candidates)
+    assert candidates == []
+    assert warnings and 'URL の形式が変わった' in warnings[0][1]
+
+    box['content'] = sitemap_of([*(f'2026/post-{i}' for i in range(12)), '2026/brand-new'])
+    assert sitemap_run(SITEMAP_CONFIG, state) == ['https://example.com/news/2026/brand-new']
 
 
 def test_sitemap_legacy_watermark_state_is_migrated(monkeypatch):

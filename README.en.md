@@ -79,6 +79,7 @@ Everything lives in `config.yaml` (annotated inline):
 | `settings.notebook_title_format` | Cleanup only deletes notebooks whose title **fully matches** this — your manual notebooks are structurally safe. |
 | `settings.timezone` | Notebook dates and monthly checks. Runners are UTC; set your own. |
 | `settings.limits` | Articles per run. Overflow is carried over to the next run, never dropped. |
+| `settings.max_age_hours` | Articles older than this many hours are not aired: they are marked read and listed in one Slack message (off by default). For a morning news show, this keeps a post-outage backlog or a late-appearing item from airing days later. |
 | `settings.audio` | Global Audio Overview settings: `format`, `length`, `prompt`, and `scope` (`run`, the default: each episode covers only that run's articles; `notebook`: the whole day). |
 | `settings.cleanup` | Auto-delete of old daily notebooks. Ships with `dry_run: true` — flip only after the would-delete list looks right. |
 | `watch:` | Notification-only page monitoring (never becomes radio). |
