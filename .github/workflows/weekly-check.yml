@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Same reason as the batch: notebooklm-py runs in this process tree.
           persist-credentials: false

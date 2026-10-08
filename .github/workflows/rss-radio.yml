@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -107,7 +107,7 @@ jobs:
           echo "Secrets OK."
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Do not leave a write token in .git/config while the batch runs:
           # notebooklm-py is third-party code running in the same process tree
