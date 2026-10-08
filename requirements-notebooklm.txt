@@ -1,0 +1,4 @@
+# notebooklm CLI のバージョン。CI(rss-radio.yml / weekly-check.yml)と scripts/setup.py がここを読む。
+# pip ではなく `uv tool install` で別環境に入れる(バッチの Python 環境とは混ぜない)。
+# 新しい版が出ると Dependabot が PR を作り、tests/test_cli_contract.py がその版の CLI で動く。
+notebooklm-py[browser]==0.8.4

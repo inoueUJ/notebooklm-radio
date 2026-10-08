@@ -1,0 +1,1872 @@
+import copy
+import datetime
+import json
+import subprocess
+import sys
+
+import pytest
+
+import radio_batch as rb
+
+UTC = datetime.UTC
+FEED_URL = 'https://example.com/feed'
+CONFIG = {'feeds': [{'name': 'Example', 'url': FEED_URL}]}
+
+
+class FakeEntry:
+    def __init__(self, index, published=None):
+        self.id = f'post-{index:05d}'
+        self.title = f'記事{index}'
+        self.link = f'https://example.com/{index}'
+        if published is not None:
+            self.published_parsed = published.timetuple()
+
+
+class FakeFeed:
+    def __init__(self, entries):
+        self.entries = entries
+        self.bozo = False
+
+
+def make_feed(count, start=None, newest_first=True):
+    """実フィードと同じく新しい順で返す。1件目が最古。"""
+    start = start or datetime.datetime(2020, 1, 1, tzinfo=UTC)
+    entries = [FakeEntry(i, start + datetime.timedelta(hours=i)) for i in range(1, count + 1)]
+    return FakeFeed(list(reversed(entries)) if newest_first else entries)
+
+
+@pytest.fixture
+def feed_box(monkeypatch):
+    """fetch_feed を差し替え、テスト側からフィードの中身を入れ替えられるようにする。"""
+    box = {'feed': make_feed(10), 'problem': None}
+    monkeypatch.setattr(rb, 'fetch_feed', lambda url: (box['feed'], box['problem']))
+    return box
+
+
+def run_once(state, feed_box=None, config=CONFIG):
+    """check_rss_feeds → select → advance_state という本番と同じ流れを1回まわす。"""
+    candidates, results, warnings = rb.check_rss_feeds(config, state)
+    selected = rb.select_articles(candidates) if candidates else []
+    rb.advance_state(state, results, selected)
+    return [a['title'] for a in selected], warnings
+
+
+# --- 障害1 のリグレッションテスト -------------------------------------------
+
+
+def test_second_run_detects_nothing_new(feed_box):
+    """2回連続で実行したら、2回目は新着ゼロでなければならない。"""
+    state = {}
+    run_once(state, feed_box)
+    titles, _ = run_once(state, feed_box)
+    assert titles == []
+
+
+def test_large_feed_does_not_oscillate(feed_box):
+    """1325件(Vercel実測値)のフィードでも、既読が未読に戻ってはいけない。"""
+    feed_box['feed'] = make_feed(1325)
+    state = {}
+
+    first, _ = run_once(state, feed_box)
+    assert first == ['記事1325']
+
+    # 新着がない限り、何度まわしても検知はゼロ
+    for _ in range(5):
+        titles, _ = run_once(state, feed_box)
+        assert titles == [], f'既読の記事が未読に戻った: {titles}'
+
+
+def test_large_feed_detects_only_genuinely_new(feed_box):
+    """1325件のフィードに1件追加したら、その1件だけが検知される。"""
+    feed_box['feed'] = make_feed(1325)
+    state = {}
+    run_once(state, feed_box)
+
+    feed_box['feed'] = make_feed(1326)
+    titles, _ = run_once(state, feed_box)
+    assert titles == ['記事1326']
+
+
+def test_recent_ids_stays_bounded(feed_box):
+    """state が無限に肥大化しない。"""
+    feed_box['feed'] = make_feed(1325)
+    state = {}
+    run_once(state, feed_box)
+    assert len(state[FEED_URL]['recent_ids']) <= rb.MAX_RECENT_IDS
+
+
+# --- 上限とデータロス --------------------------------------------------------
+
+
+def test_first_run_processes_only_latest(feed_box):
+    feed_box['feed'] = make_feed(50)
+    state = {}
+    titles, _ = run_once(state, feed_box)
+    assert titles == ['記事50']
+
+
+def test_overflow_is_carried_over_not_dropped(feed_box):
+    """上限を超えた新着は「既読扱いで捨てる」のではなく、次回に持ち越す。"""
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box)  # 初回: 記事10 のみ処理、記事1-9 は既読
+
+    # 新たに 9 件公開される
+    feed_box['feed'] = make_feed(19)
+
+    seen = []
+    for _ in range(5):
+        titles, _ = run_once(state, feed_box)
+        seen.extend(titles)
+
+    # 9件すべてが、古い順に、重複なく処理される
+    assert seen == [f'記事{i}' for i in range(11, 20)]
+
+
+def test_per_feed_cap_is_respected(feed_box):
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box)
+    feed_box['feed'] = make_feed(30)
+    titles, _ = run_once(state, feed_box)
+    assert len(titles) == rb.MAX_ARTICLES_PER_FEED
+
+
+# --- 同時刻の記事（日付だけのフィード: Cloudflare Changelog / Vercel / Codex 等） ----
+
+SAME_DAY = datetime.datetime(2026, 9, 22, tzinfo=UTC)
+
+
+def same_day_feed(indexes):
+    """全エントリが同じ公開時刻（日付のみ）のフィード。新しい順で返す。"""
+    return FakeFeed([FakeEntry(i, SAME_DAY) for i in reversed(indexes)])
+
+
+def test_same_timestamp_overflow_is_carried_over_not_lost(feed_box):
+    """同じ日に 7 件公開され上限で 3 件しか処理できなくても、残りは次回に持ち越される。
+
+    2026-09-22 の実測: Cloudflare Changelog の同日 7 件のうち 4 件が、透かしと同時刻という
+    理由だけで既読扱いになり、一度も処理されずに消えた。
+    """
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box)  # 初回
+
+    feed_box['feed'] = same_day_feed(range(11, 18))
+    seen = []
+    for _ in range(4):
+        titles, _ = run_once(state, feed_box)
+        seen.extend(titles)
+    assert sorted(seen) == [f'記事{i}' for i in range(11, 18)]
+    assert run_once(state, feed_box)[0] == []  # 全部処理したら、それ以上は出てこない
+
+
+def test_late_post_with_same_timestamp_is_detected(feed_box):
+    """処理済みの記事と同じ日付で後から追加された記事も、新着として検知される。"""
+    feed_box['feed'] = same_day_feed([1, 2])
+    state = {}
+    run_once(state, feed_box)  # 初回: 全既読
+
+    feed_box['feed'] = same_day_feed([1, 2, 3])
+    assert run_once(state, feed_box)[0] == ['記事3']
+    assert run_once(state, feed_box)[0] == []
+
+
+# --- 前日付で後から現れる記事 / 公開時刻が後から動く記事（2026-09 の実測） ----------
+
+# 過去の日付で組む（未来日付は透かしが「今」で止まるので、テストが実時刻に依存してしまう）
+BASE = datetime.datetime(2026, 6, 1, tzinfo=UTC)
+DAY = datetime.timedelta(days=1)
+HOUR = datetime.timedelta(hours=1)
+
+
+def feed_of(*pairs):
+    """(番号, 公開時刻) の組からフィードを作る。実フィードと同じく新しい順に並べる。"""
+    entries = sorted((FakeEntry(i, ts) for i, ts in pairs), key=lambda e: e.published_parsed, reverse=True)
+    return FakeFeed(entries)
+
+
+def test_replacement_feed_does_not_replay_what_its_host_already_covered(feed_box):
+    """全体版を同じホストの狭いフィードに置き換えたとき、初回の 1 件で放送済みの記事を流さない。
+
+    2026-09-29: Cloudflare Changelog / GitHub / Google Cloud を狭いフィードに置き換えると、
+    初回の最新 1 件が 4 本とも数日前に放送済みの記事だった。
+    """
+    narrow = {'feeds': [{'name': 'Narrow', 'url': 'https://example.com/feed/label/actions'}]}
+    state = {'https://example.com/feed': {'watermark': (BASE + DAY).isoformat(), 'recent_ids': []}}
+
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY))  # 最新も旧フィードの透かし以前
+    assert run_once(state, feed_box, narrow)[0] == []
+    assert 'https://example.com/feed/label/actions' in state  # 既読化はされている
+
+    # 以後は普通に新着を拾う
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY), (3, BASE + 2 * DAY))
+    assert run_once(state, feed_box, narrow)[0] == ['記事3']
+
+
+def test_new_feed_on_known_host_still_airs_a_newer_latest(feed_box):
+    """同じホストでも、旧フィードの透かしより新しい最新記事は初回に流す（Claude Code の changelog）。"""
+    config = {'feeds': [{'name': 'Changelog', 'url': 'https://example.com/changelog/rss.xml'}]}
+    state = {'https://example.com/whats-new/rss.xml': {'watermark': BASE.isoformat(), 'recent_ids': []}}
+    feed_box['feed'] = feed_of((1, BASE - DAY), (2, BASE + DAY))
+    assert run_once(state, feed_box, config)[0] == ['記事2']
+
+
+def test_backdated_late_entry_is_detected(feed_box):
+    """透かしより前の日付で後から差し込まれた記事も拾う。
+
+    2026-09-23 の実例: OpenAI は 13:00 の記事を処理した後に、同じ日の 01:00〜12:00 付けの記事を
+    7 件出した。透かしだけの判定では現れた時点で既読扱いになり、一度も放送されなかった。
+    """
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)  # 初回
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 13 * HOUR))
+    assert run_once(state, feed_box)[0] == ['記事2']
+
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 13 * HOUR), (3, BASE + HOUR))
+    assert run_once(state, feed_box)[0] == ['記事3']
+    assert run_once(state, feed_box)[0] == []
+
+
+def test_lookback_stops_at_seven_days(feed_box):
+    """振り返りは LOOKBACK まで。それより古い日付で現れた記事は既読のまま（巨大フィードの再流入を防ぐ）。"""
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    later = BASE + 30 * DAY
+    feed_box['feed'] = feed_of((1, BASE), (2, later))
+    assert run_once(state, feed_box)[0] == ['記事2']
+
+    feed_box['feed'] = feed_of((1, BASE), (2, later), (3, later - 8 * DAY), (4, later - 6 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事4']
+
+
+def test_redated_entry_is_not_reprocessed(feed_box):
+    """処理済みの記事の公開時刻が後から動いても再放送しない。
+
+    2026-09 の実例: Vercel が記事の日付を付け直し（Atom の updated が動く）、09-26 に放送した記事が
+    09-29 に新着として再放送された。Claude Code の what's new でも Week 33 の日付が 24 日動いた。
+    """
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    # 同じ回に 2 件処理する。記事2 は透かし（記事3 の時刻）と同時刻ではないので、同時刻の分だけ
+    # 覚える方式では ID が残らない（Vercel の実例もこの形）
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY), (3, BASE + 2 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事2', '記事3']
+
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 4 * DAY), (3, BASE + 2 * DAY))  # 記事2 の日付が後ろへ動く
+    assert run_once(state, feed_box)[0] == []
+
+
+def test_weekly_redated_post_stays_read_after_ids_overflow(feed_box, monkeypatch):
+    """毎週日付が進む定期投稿（Cloudflare の WAF 予定、Google Cloud の What's new）は、
+    処理済み ID が上限を超えて溢れても再浮上しない。振り返り範囲にいる間は ID を消さないため。"""
+    monkeypatch.setattr(rb, 'MAX_RECENT_IDS', 3)
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    rolling = 900
+    feed_box['feed'] = feed_of((1, BASE), (rolling, BASE + DAY))
+    assert run_once(state, feed_box)[0] == [f'記事{rolling}']
+
+    for week in range(1, 8):
+        start = BASE + 7 * week * DAY
+        # 毎週 2 件の新着。1 回の上限(3)に余裕を残し、定期投稿が未読に戻れば必ず拾われる形にする
+        fresh = [(100 * week + k, start + k * HOUR) for k in range(2)]
+        feed_box['feed'] = feed_of((1, BASE), (rolling, start + DAY), *fresh)
+        titles, _ = run_once(state, feed_box)
+        assert sorted(titles) == sorted(f'記事{i}' for i, _ in fresh)
+
+
+def test_state_without_floor_does_not_replay_last_week(feed_box):
+    """振り返り導入前の state（処理済み ID を同時刻の分しか残していない）に切り替えても、
+    過去 1 週間分を再放送しない。振り返りは移行時点の透かしより前へ遡らない。"""
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 2 * DAY), (3, BASE + 4 * DAY))
+    state = {FEED_URL: {'watermark': (BASE + 4 * DAY).isoformat(), 'recent_ids': ['post-00003']}}
+    assert run_once(state, feed_box)[0] == []
+
+    # 移行後に前日付で差し込まれた記事は拾う
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + 2 * DAY), (3, BASE + 4 * DAY), (4, BASE + 5 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事4']
+    assert state[FEED_URL]['floor'] == (BASE + 4 * DAY).isoformat()
+    feed_box['feed'] = feed_of(
+        (1, BASE), (2, BASE + 2 * DAY), (3, BASE + 4 * DAY), (4, BASE + 5 * DAY), (5, BASE + 4 * DAY + HOUR)
+    )
+    assert run_once(state, feed_box)[0] == ['記事5']
+    assert run_once(state, feed_box)[0] == []
+
+
+def test_future_dated_entry_does_not_push_watermark_past_now(feed_box):
+    """誤った未来日付 1 件で透かしが未来へ飛ぶと、その日付までの記事が全部既読になる。透かしは「今」で止める。"""
+    now = datetime.datetime.now(UTC)
+    feed_box['feed'] = feed_of((1, now - DAY))
+    state = {}
+    run_once(state, feed_box)
+    feed_box['feed'] = feed_of((1, now - DAY), (2, now + 365 * DAY))
+    assert run_once(state, feed_box)[0] == ['記事2']
+    assert datetime.datetime.fromisoformat(state[FEED_URL]['watermark']) <= datetime.datetime.now(UTC)
+
+    feed_box['feed'] = feed_of((1, now - DAY), (2, now + 365 * DAY), (3, now - HOUR))
+    assert run_once(state, feed_box)[0] == ['記事3']
+    assert run_once(state, feed_box)[0] == []  # 未来日付の記事自体も、処理済み ID で既読のまま
+
+
+# --- 鮮度の足切り（settings.max_age_hours） ------------------------------------
+
+
+def test_stale_articles_are_skipped_recorded_and_reported_once(feed_box, monkeypatch):
+    """朝に最新情報を聞くラジオなので、公開から時間が経ちすぎた記事は流さない。
+    見送った記事は既読にして一度だけ知らせる（次回また見送り通知を出さない）。"""
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    first, results, _ = rb.check_rss_feeds(CONFIG, state, now=BASE + DAY)  # 初回（透かしは BASE）
+    rb.advance_state(state, results, rb.select_articles(first), now=BASE + DAY)
+
+    # 障害明けなどで 10 日後に見ると、4 日前の記事（振り返り範囲内だが 72 時間超）と 1 日前の記事がある
+    now = BASE + 10 * DAY
+    feed_box['feed'] = feed_of((1, BASE), (2, now - 4 * DAY), (3, now - DAY))
+    candidates, results, _ = rb.check_rss_feeds(CONFIG, state, now=now)
+    assert [a['title'] for a in candidates] == ['記事3']
+    assert [e['title'] for e in results[0]['skipped']] == ['記事2']
+    rb.advance_state(state, results, rb.select_articles(candidates), now=now)
+
+    candidates, results, _ = rb.check_rss_feeds(CONFIG, state, now=now)
+    assert candidates == [] and not results[0].get('skipped')
+
+
+def test_first_run_does_not_air_a_stale_latest(feed_box, monkeypatch):
+    """新しく足したフィードの最新記事が古ければ、初回でも流さない（MCP ブログの 5 週間前の記事）。"""
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    now = BASE + 40 * DAY
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY))
+    candidates, results, _ = rb.check_rss_feeds(CONFIG, {}, now=now)
+    assert candidates == [] and not results[0].get('skipped')  # 初回の既読化は見送りとして数えない
+
+
+def test_dateless_entries_are_never_stale(feed_box, monkeypatch):
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    feed_box['feed'] = rb.SimpleNamespace(entries=[FakeEntry(1)])
+    state = {}
+    run_once(state, feed_box)
+    feed_box['feed'].entries.append(FakeEntry(2))
+    assert run_once(state, feed_box)[0] == ['記事2']
+
+
+def test_stale_notification_lists_newest_first_and_caps(monkeypatch):
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    arts = [
+        {'title': f't{i}', 'link': f'https://e.example/{i}', 'feed_name': 'F', 'ts': BASE + i * HOUR}
+        for i in range(rb.STALE_LIST_MAX + 3)
+    ]
+    rb.send_stale_notification('https://hooks.slack.com/x', arts + arts[:1])  # 同じ URL は 1 回だけ
+
+    text = posted[0]['text']
+    assert '72 時間' in text and f'（{rb.STALE_LIST_MAX + 3}件）' in text
+    assert text.index(f't{rb.STALE_LIST_MAX + 2}') < text.index('t3')  # 新しい順
+    assert 'ほか 3 件' in text
+
+
+def test_validate_max_age_hours():
+    base = {'feeds': [{'name': 'A', 'url': 'https://a.example/feed'}]}
+    assert rb.validate_config({**base, 'settings': {'max_age_hours': 72}}) == []
+    with pytest.raises(rb.ConfigError, match='max_age_hours'):
+        rb.validate_config({**base, 'settings': {'max_age_hours': 0}})
+
+
+def test_many_same_timestamp_entries_do_not_oscillate(feed_box):
+    """同時刻の ID は recent_ids の上限で溢れても未読に戻らない。"""
+    feed_box['feed'] = same_day_feed(range(1, rb.MAX_RECENT_IDS + 51))
+    state = {}
+    run_once(state, feed_box)
+    for _ in range(3):
+        assert run_once(state, feed_box)[0] == []
+
+
+# --- フィードをまたいだ同一 URL（Vercel の blog/feed と atom は同一内容） -----------
+
+
+def test_duplicate_url_across_feeds_is_processed_once(monkeypatch):
+    """同じ記事を配信する 2 フィードでも投入は 1 回だけ。GUID が違っても URL で既読が両方進む。"""
+    config = {'feeds': [{'name': 'A', 'url': 'https://example.com/a'}, {'name': 'B', 'url': 'https://example.com/b'}]}
+    box = {'count': 10}
+
+    def fetch(url):
+        feed = make_feed(box['count'])
+        for e in feed.entries:
+            e.id = f'{url}#{e.id}'  # GUID はフィードごとに違うが link は同じ
+        return feed, None
+
+    monkeypatch.setattr(rb, 'fetch_feed', fetch)
+    state = {}
+    assert run_once(state, config=config)[0] == ['記事10']  # 初回も 1 件だけ
+
+    box['count'] = 11
+    assert run_once(state, config=config)[0] == ['記事11']
+    assert run_once(state, config=config)[0] == []
+    assert state['https://example.com/a']['watermark'] == state['https://example.com/b']['watermark']
+
+
+# --- 公開時刻を持たないエントリ ----------------------------------------------
+
+
+def test_dateless_entries_are_not_reprocessed(feed_box):
+    dateless = [FakeEntry(1), FakeEntry(2)]
+    feed_box['feed'] = FakeFeed(dateless)
+
+    state = {}
+    first, _ = run_once(state, feed_box)
+    assert len(first) == 1
+
+    second, _ = run_once(state, feed_box)
+    assert second == []
+
+
+# --- フィードの健全性 --------------------------------------------------------
+
+
+def test_dead_feed_warns_and_stays_first_run(feed_box):
+    feed_box['feed'] = None
+    feed_box['problem'] = 'HTTP 403'
+
+    state = {}
+    titles, warnings = run_once(state, feed_box)
+    assert titles == []
+    assert warnings == [('Example', 'HTTP 403')]
+    # 死んだフィードで state を初期化してしまわない
+    assert FEED_URL not in state
+
+
+def test_recovered_feed_runs_as_first_run(feed_box):
+    feed_box['feed'] = None
+    feed_box['problem'] = 'エントリが0件'
+    state = {}
+    run_once(state, feed_box)
+
+    feed_box['feed'] = make_feed(5)
+    feed_box['problem'] = None
+    titles, _ = run_once(state, feed_box)
+    assert titles == ['記事5']
+
+
+# --- 旧形式 state からの移行 -------------------------------------------------
+
+
+def test_legacy_list_state_is_migrated(feed_box):
+    feed_box['feed'] = make_feed(20)
+    state = {FEED_URL: ['post-00019', 'post-00020']}
+    titles, _ = run_once(state, feed_box)
+
+    assert titles == ['記事20']  # 初回実行として扱われる
+    assert isinstance(state[FEED_URL], dict)
+    assert 'watermark' in state[FEED_URL]
+
+
+# --- タイムゾーン ------------------------------------------------------------
+
+
+def test_notebook_title_uses_jst_not_utc():
+    config = {'settings': {'notebook_title_format': 'Tech Radio {date}'}}
+    # 07:00 JST 7/10 == 22:00 UTC 7/9。UTC 日付を使うと前日名になる。
+    utc_now = datetime.datetime(2026, 7, 9, 22, 0, tzinfo=UTC)
+    assert rb.notebook_title_for(config, now=utc_now) == 'Tech Radio 2026-07-10'
+
+
+def test_notebook_title_includes_topic():
+    config = {'settings': {'notebook_title_format': 'Tech Radio {topic} {date}'}}
+    now = datetime.datetime(2026, 7, 10, 9, 0, tzinfo=rb.JST)
+    assert rb.notebook_title_for(config, topic='Infra', now=now) == 'Tech Radio Infra 2026-07-10'
+    assert rb.notebook_title_for(config, now=now) == f'Tech Radio {rb.DEFAULT_TOPIC} 2026-07-10'
+
+
+# --- 全体上限 ----------------------------------------------------------------
+
+
+def test_select_articles_keeps_oldest_and_all_first_runs():
+    def art(i, first_run=False):
+        return {
+            'id': f'a{i}',
+            'ts': datetime.datetime(2026, 1, 1, tzinfo=UTC) + datetime.timedelta(hours=i),
+            'title': f't{i}',
+            'link': f'l{i}',
+            'feed_name': 'F',
+            'feed_url': 'u',
+            '_first_run': first_run,
+        }
+
+    candidates = [art(i) for i in range(20)] + [art(99, first_run=True)]
+    selected = rb.select_articles(candidates)
+
+    assert len(selected) == rb.MAX_ARTICLES_TOTAL
+    assert selected[0]['title'] == 't99'  # 初回分は必ず残る
+    # 残りは古い順
+    rest = [a['title'] for a in selected[1:]]
+    assert rest == [f't{i}' for i in range(rb.MAX_ARTICLES_TOTAL - 1)]
+
+
+def test_total_cap_serves_short_window_feeds_first(monkeypatch):
+    """全体上限の枠は、フィードから押し出されそうな記事に先に回す。
+
+    2026-08-20〜09-13 の実測: 障害明けに古い記事を溜めた Vercel などが毎回 15 枠を使い切り、
+    10 件しか表示しない GitHub Changelog は 30 回連続で枠を得られず、152 件中 101 件が
+    処理される前にフィードから消えた。
+    """
+    monkeypatch.setattr(rb, 'MAX_ARTICLES_TOTAL', 4)
+    big = make_feed(1000)  # Vercel 相当: 表示範囲が広く、古い記事が溜まっていても消えない
+    small = make_feed(10, start=datetime.datetime(2026, 1, 1, tzinfo=UTC))  # GitHub 相当: 10 件だけ
+    for e in small.entries:
+        e.id, e.link = f'small-{e.id}', f'https://small.example/{e.id}'
+    feeds = {'https://big.example/feed': big, 'https://small.example/feed': small}
+    monkeypatch.setattr(rb, 'fetch_feed', lambda url: (feeds[url], None))
+    config = {
+        'feeds': [
+            {'name': 'Big', 'url': 'https://big.example/feed'},
+            {'name': 'Small', 'url': 'https://small.example/feed'},
+        ]
+    }
+    # Big は表示範囲の上の方 10 件だけが未読（溜まっているが、押し出されるまで 990 件の余裕がある）。
+    # 時刻は Big の方が古いので、古い順だけで切ると Big が 3 枠を取り、Small は 1 枠しか得られない
+    big_mark = (datetime.datetime(2020, 1, 1, tzinfo=UTC) + datetime.timedelta(hours=990)).isoformat()
+    small_mark = datetime.datetime(2025, 12, 1, tzinfo=UTC).isoformat()
+    state = {
+        'https://big.example/feed': {'watermark': big_mark, 'recent_ids': []},
+        'https://small.example/feed': {'watermark': small_mark, 'recent_ids': []},
+    }
+
+    candidates, _results, _ = rb.check_rss_feeds(config, state)
+    selected = [a['feed_name'] for a in rb.select_articles(candidates)]
+
+    # Small の 3 件（押し出し寸前）が先に入り、残り 1 枠が Big の最古
+    assert selected.count('Small') == 3 and selected.count('Big') == 1
+
+
+# --- 実行のたびの警告と実行記録 -----------------------------------------------
+
+
+def test_warns_when_every_visible_entry_is_unread(feed_box):
+    """見えている記事が全部未読 = それより古い記事は処理前に消えたかもしれない（GitHub で 101 件を失った形）。"""
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    run_once(state, feed_box)
+    feed_box['feed'] = feed_of(*[(i, BASE + i * HOUR) for i in range(2, 12)])  # 表示 10 件がすべて新着
+    _titles, warnings = run_once(state, feed_box)
+    assert any('すべて未読' in reason for _name, reason in warnings)
+
+    feed_box['feed'] = feed_of((1, BASE), *[(i, BASE + i * HOUR) for i in range(2, 12)])
+    assert not any('すべて未読' in reason for _name, reason in run_once(state, feed_box)[1])
+
+
+def test_warns_when_url_mode_feed_links_share_one_page(feed_box):
+    """#アンカーのリンクを URL のまま渡すとページ全体が毎回入る（Codex で 42 回）。text 指定なら黙る。"""
+    entries = [FakeEntry(i, BASE + i * HOUR) for i in range(1, 4)]
+    for e in entries:
+        e.link = f'https://docs.example/changelog#v{e.id}'
+    feed_box['feed'] = FakeFeed(list(reversed(entries)))
+
+    _c, _r, warnings = rb.check_rss_feeds(CONFIG, {})
+    assert any('# 位置' in reason for _name, reason in warnings)
+
+    text_config = {'feeds': [{'name': 'Example', 'url': FEED_URL, 'source_mode': 'text'}]}
+    _c, _r, warnings = rb.check_rss_feeds(text_config, {})
+    assert not any('# 位置' in reason for _name, reason in warnings)
+
+
+def test_record_run_keeps_a_bounded_history(monkeypatch):
+    monkeypatch.setattr(rb, 'MAX_RUN_HISTORY', 3)
+    state = {}
+    for i in range(5):
+        rb.record_run(state, BASE + i * DAY, [f'https://a.example/{i}'], [], [], ['New feed'] if i == 0 else [])
+    runs = state[rb.RUNS_KEY]
+    assert len(runs) == 3
+    assert runs[-1]['aired'] == ['https://a.example/4'] and runs[-1]['at'] == (BASE + 4 * DAY).isoformat()
+
+
+def test_run_history_does_not_look_like_a_feed_to_the_host_check(feed_box):
+    """実行記録（_runs）は state の中にあるが、同じホストの既読判定には混ざらない。"""
+    state = {rb.RUNS_KEY: [{'at': BASE.isoformat(), 'aired': ['https://example.com/1']}]}
+    assert rb.host_covered_until(state, FEED_URL, FEED_URL) is None
+
+
+def test_recall_notebooks_are_cleaned_up_only_when_enabled():
+    config = {
+        'feeds': [{'name': 'A', 'url': 'https://a.example/feed', 'topic': 'AI'}],
+        'settings': {'notebook_title_format': 'Tech Radio {topic} {date}'},
+    }
+    matches = lambda cfg: any(p.fullmatch('Tech Radio Recall 2026-09-01') for p in rb._notebook_title_patterns(cfg))  # noqa: E731
+    assert not matches(config)
+    assert matches({**config, 'weekly_check': {'recall': True}})
+
+
+def test_validate_weekly_check():
+    base = {'feeds': [{'name': 'A', 'url': 'https://a.example/feed'}]}
+    assert rb.validate_config({**base, 'weekly_check': {'recall': True, 'recall_query': 'q'}}) == []
+    with pytest.raises(rb.ConfigError, match='weekly_check'):
+        rb.validate_config({**base, 'weekly_check': {'recall': 'yes'}})
+    with pytest.raises(rb.ConfigError, match='weekly_check'):
+        rb.validate_config({**base, 'weekly_check': {'typo': True}})
+
+
+# --- Secret のマスキング -----------------------------------------------------
+
+
+def test_redact_removes_secrets(monkeypatch):
+    monkeypatch.setenv('NOTIFY_WEBHOOK_URL', 'https://hooks.slack.com/services/SUPERSECRET')
+    monkeypatch.setenv('NOTEBOOKLM_AUTH_JSON', '{"cookies": [{"value": "abcdefghijklmnopqrstuvwxyz"}]}')
+
+    text = 'failed: https://hooks.slack.com/services/SUPERSECRET cookie=abcdefghijklmnopqrstuvwxyz'
+    out = rb.redact(text)
+
+    assert 'SUPERSECRET' not in out
+    assert 'abcdefghijklmnopqrstuvwxyz' not in out
+
+
+def test_redact_truncates():
+    assert len(rb.redact('x' * 5000)) == 1500
+
+
+# --- sitemap フィード ---------------------------------------------------------
+
+SITEMAP_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/news</loc><lastmod>2026-07-01T00:00:00.000Z</lastmod></url>
+  <url><loc>https://example.com/news/hello-world</loc><lastmod>2026-07-02T09:30:00.000Z</lastmod></url>
+  <url><loc>https://example.com/news/no-date</loc></url>
+  <url><loc>https://example.com/about</loc><lastmod>2026-07-03T00:00:00.000Z</lastmod></url>
+</urlset>
+"""
+
+
+class FakeResponse:
+    def __init__(self, content=b'', status_code=200):
+        self.content = content
+        self.status_code = status_code
+
+
+def test_sitemap_feed_filters_by_prefix_and_reads_lastmod(monkeypatch):
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(SITEMAP_XML))
+    feed, problem = rb.fetch_sitemap_feed('https://example.com/sitemap.xml', 'https://example.com/news/')
+
+    assert problem is None
+    # /news 自身と /about は除外され、記事2件だけが残る
+    assert [e.link for e in feed.entries] == [
+        'https://example.com/news/hello-world',
+        'https://example.com/news/no-date',
+    ]
+    dated, dateless = feed.entries
+    assert dated.title == 'hello world'
+    assert rb.entry_time(dated) == datetime.datetime(2026, 7, 2, 9, 30, tzinfo=UTC)
+    assert rb.entry_time(dateless) is None
+
+
+def test_sitemap_feed_reports_problems(monkeypatch):
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(status_code=404))
+    feed, problem = rb.fetch_sitemap_feed('https://example.com/sitemap.xml', 'https://example.com/news/')
+    assert feed is None and problem == 'HTTP 404'
+
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(SITEMAP_XML))
+    feed, problem = rb.fetch_sitemap_feed('https://example.com/sitemap.xml', 'https://example.com/nothing/')
+    assert feed is None and 'prefix' in problem
+
+
+def test_sitemap_feed_end_to_end_detects_new_article(monkeypatch):
+    """sitemap型フィードでも 初回→新着なし→新着1件 の流れが watermark で回る。"""
+    config = {
+        'feeds': [
+            {
+                'name': 'Sitemap',
+                'type': 'sitemap',
+                'url': 'https://example.com/sitemap.xml',
+                'prefix': 'https://example.com/news/',
+            }
+        ]
+    }
+    box = {'content': SITEMAP_XML}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+
+    def run(state):
+        candidates, results, _ = rb.check_rss_feeds(config, state)
+        rb.advance_state(state, results, candidates)
+        return [a['link'] for a in candidates]
+
+    state = {}
+    # 初回は既読化だけ。lastmod は更新日なので「最新」を決められず、選ぶと古いページを流しかねない
+    assert run(state) == []
+    assert run(state) == []  # 変化なし
+
+    box['content'] = SITEMAP_XML.replace(
+        b'</urlset>',
+        b'<url><loc>https://example.com/news/brand-new</loc><lastmod>2026-07-05T00:00:00.000Z</lastmod></url></urlset>',
+    )
+    assert run(state) == ['https://example.com/news/brand-new']
+
+
+SITEMAP_CONFIG = {
+    'feeds': [
+        {
+            'name': 'Sitemap',
+            'type': 'sitemap',
+            'url': 'https://example.com/sitemap.xml',
+            'prefix': 'https://example.com/news/',
+        }
+    ]
+}
+
+
+def sitemap_run(config, state):
+    candidates, results, _ = rb.check_rss_feeds(config, state)
+    rb.advance_state(state, results, candidates)
+    return [a['link'] for a in candidates]
+
+
+def test_sitemap_lastmod_bump_does_not_resurface_article(monkeypatch):
+    """既存記事の lastmod だけ動いても新着扱いしない（4月の記事が7月に「新着」で再浮上した障害の再発防止）。"""
+    box = {'content': SITEMAP_XML}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+
+    state = {}
+    sitemap_run(SITEMAP_CONFIG, state)  # 初回: 全既読化
+
+    # 既存記事が編集されて lastmod が最近の日付に動く
+    box['content'] = SITEMAP_XML.replace(b'2026-07-02T09:30:00.000Z', b'2026-07-14T00:00:00.000Z')
+    assert sitemap_run(SITEMAP_CONFIG, state) == []
+
+
+SHARED_SITEMAP = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/news/first</loc><lastmod>2026-07-10T00:00:00Z</lastmod></url>
+  <url><loc>https://example.com/eng/intro</loc><lastmod>2026-07-01T00:00:00Z</lastmod></url>
+</urlset>
+"""
+
+SHARED_CONFIG = {
+    'feeds': [
+        {
+            'name': 'News',
+            'type': 'sitemap',
+            'url': 'https://example.com/sitemap.xml',
+            'prefix': 'https://example.com/news/',
+        },
+        {
+            'name': 'Eng',
+            'type': 'sitemap',
+            'url': 'https://example.com/sitemap.xml',
+            'prefix': 'https://example.com/eng/',
+        },
+    ]
+}
+
+
+def test_sitemap_feeds_sharing_url_have_independent_state(monkeypatch):
+    """同一 sitemap を prefix 違いで購読する2フィードが state を奪い合わない（Anthropic news/engineering の障害）。"""
+    box = {'content': SHARED_SITEMAP}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+
+    state = {}
+    assert sitemap_run(SHARED_CONFIG, state) == []  # 初回は既読化だけ
+    # state はフィードごとに独立したキーで持つ
+    assert 'sitemap:https://example.com/sitemap.xml:https://example.com/news/' in state
+    assert 'sitemap:https://example.com/sitemap.xml:https://example.com/eng/' in state
+
+    # news 側の最新(7/10)より古い lastmod の eng 記事(7/5)でも、確実に検知される
+    box['content'] = SHARED_SITEMAP.replace(
+        b'</urlset>',
+        b'<url><loc>https://example.com/eng/older-than-news</loc><lastmod>2026-07-05T00:00:00Z</lastmod></url></urlset>',
+    )
+    assert sitemap_run(SHARED_CONFIG, state) == ['https://example.com/eng/older-than-news']
+
+
+def test_sitemap_trailing_slash_change_is_not_news(monkeypatch):
+    """URL の末尾に / が付いただけの記事を新着にしない（antigravity.google、2026-09）。"""
+    box = {'content': SITEMAP_XML}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+    state = {}
+    sitemap_run(SITEMAP_CONFIG, state)  # 初回
+
+    box['content'] = SITEMAP_XML.replace(b'hello-world</loc>', b'hello-world/</loc>').replace(
+        b'no-date</loc>', b'no-date/</loc>'
+    )
+    assert sitemap_run(SITEMAP_CONFIG, state) == []
+
+
+def test_sitemap_seen_saved_with_trailing_slash_still_matches(monkeypatch):
+    """正規化を入れる前に / 付きで保存された既読集合（Antigravity の 2026-09-29 時点の state）とも一致させる。"""
+    box = {'content': SITEMAP_XML}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+    key = 'sitemap:https://example.com/sitemap.xml:https://example.com/news/'
+    state = {key: {'seen': ['https://example.com/news/hello-world/', 'https://example.com/news/no-date/']}}
+    assert sitemap_run(SITEMAP_CONFIG, state) == []
+
+
+def sitemap_of(paths):
+    urls = ''.join(f'<url><loc>https://example.com/news/{p}</loc></url>' for p in paths)
+    return f'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>'.encode()
+
+
+def test_sitemap_mass_url_change_is_rebaselined_with_a_warning(monkeypatch):
+    """半分以上の URL が一度に未読 = URL の形式が変わった。流さずに既読を付け直し、警告を出す。"""
+    box = {'content': sitemap_of(f'post-{i}' for i in range(12))}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+    state = {}
+    sitemap_run(SITEMAP_CONFIG, state)
+
+    box['content'] = sitemap_of(f'2026/post-{i}' for i in range(12))  # 全記事の URL が付け替わる
+    candidates, results, warnings = rb.check_rss_feeds(SITEMAP_CONFIG, state)
+    rb.advance_state(state, results, candidates)
+    assert candidates == []
+    assert warnings and 'URL の形式が変わった' in warnings[0][1]
+
+    box['content'] = sitemap_of([*(f'2026/post-{i}' for i in range(12)), '2026/brand-new'])
+    assert sitemap_run(SITEMAP_CONFIG, state) == ['https://example.com/news/2026/brand-new']
+
+
+def test_sitemap_legacy_watermark_state_is_migrated(monkeypatch):
+    """旧形式（URLキー + watermark）の state から既読集合へ移行し、再処理も取りこぼしもしない。"""
+    box = {'content': SITEMAP_XML}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+
+    state = {
+        'https://example.com/sitemap.xml': {
+            'watermark': '2026-07-02T09:30:00+00:00',
+            'recent_ids': ['https://example.com/news/no-date'],
+            'last_new': '2026-07-02T10:00:00+00:00',
+        }
+    }
+    # 移行直後: 既読は既読のまま（初回扱いで最新1件が再処理されたりしない）
+    assert sitemap_run(SITEMAP_CONFIG, state) == []
+    key = 'sitemap:https://example.com/sitemap.xml:https://example.com/news/'
+    assert 'https://example.com/sitemap.xml' not in state  # 旧キーは掃除される
+    assert set(state[key]['seen']) == {
+        'https://example.com/news/hello-world',
+        'https://example.com/news/no-date',
+    }
+    assert state[key]['last_new'] == '2026-07-02T10:00:00+00:00'  # 停滞検知用の日時も引き継ぐ
+
+    # 移行後も新着は普通に検知される
+    box['content'] = SITEMAP_XML.replace(
+        b'</urlset>',
+        b'<url><loc>https://example.com/news/post-migration</loc></url></urlset>',
+    )
+    assert sitemap_run(SITEMAP_CONFIG, state) == ['https://example.com/news/post-migration']
+
+
+# --- ページ更新監視 (watch) ---------------------------------------------------
+
+WATCH_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://support.example.com/en/articles/111-widget-promo</loc><lastmod>2026-07-01T00:00:00Z</lastmod></url>
+  <url><loc>https://support.example.com/en/articles/222-usage-limits</loc><lastmod>2026-07-02T00:00:00Z</lastmod></url>
+  <url><loc>https://support.example.com/en/articles/333-how-to-login</loc><lastmod>2026-07-03T00:00:00Z</lastmod></url>
+</urlset>
+"""
+
+WATCH_CONFIG = {
+    'watch': [
+        {
+            'name': 'Support',
+            'url': 'https://support.example.com/sitemap.xml',
+            'prefix': 'https://support.example.com/en/articles/',
+            'keywords': ['widget', 'usage'],
+        }
+    ]
+}
+
+
+@pytest.fixture
+def watch_box(monkeypatch):
+    box = {'content': WATCH_XML, 'posted': []}
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(box['content']))
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: box['posted'].append(payload))
+    return box
+
+
+def test_watch_first_run_records_without_notifying(watch_box):
+    state = {}
+    warnings = rb.check_watch_pages(WATCH_CONFIG, state, 'https://hooks.example.com')
+    assert warnings == []
+    assert watch_box['posted'] == []
+    # キーワードに一致した2件だけ記録される（how-to-login は対象外）
+    key = 'watch:https://support.example.com/sitemap.xml:https://support.example.com/en/articles/'
+    assert set(state[key]['lastmod']) == {
+        'https://support.example.com/en/articles/111-widget-promo',
+        'https://support.example.com/en/articles/222-usage-limits',
+    }
+
+
+def test_watch_detects_update_and_new_page(watch_box):
+    state = {}
+    rb.check_watch_pages(WATCH_CONFIG, state, 'https://hooks.example.com')
+
+    # 変化なし → 通知なし
+    rb.check_watch_pages(WATCH_CONFIG, state, 'https://hooks.example.com')
+    assert watch_box['posted'] == []
+
+    # 既存記事の lastmod が動き、新記事も増える（キーワード非該当の新記事は無視）
+    watch_box['content'] = WATCH_XML.replace(b'2026-07-01T00:00:00Z', b'2026-07-10T00:00:00Z').replace(
+        b'</urlset>',
+        b'<url><loc>https://support.example.com/en/articles/444-widget-pricing</loc>'
+        b'<lastmod>2026-07-10T00:00:00Z</lastmod></url>'
+        b'<url><loc>https://support.example.com/en/articles/555-irrelevant</loc>'
+        b'<lastmod>2026-07-10T00:00:00Z</lastmod></url></urlset>',
+    )
+    rb.check_watch_pages(WATCH_CONFIG, state, 'https://hooks.example.com')
+    assert len(watch_box['posted']) == 1
+    text = watch_box['posted'][0]['text']
+    assert '更新' in text and '111-widget-promo' in text
+    assert '新規' in text and '444-widget-pricing' in text
+    assert '555-irrelevant' not in text
+
+    # 通知後は既読になり、再通知されない
+    rb.check_watch_pages(WATCH_CONFIG, state, 'https://hooks.example.com')
+    assert len(watch_box['posted']) == 1
+
+
+def test_watch_fetch_failure_does_not_initialize_state(watch_box, monkeypatch):
+    monkeypatch.setattr(rb.httpx, 'get', lambda *a, **k: FakeResponse(status_code=404))
+    state = {}
+    warnings = rb.check_watch_pages(WATCH_CONFIG, state, 'https://hooks.example.com')
+    assert warnings == [('Support', 'HTTP 404')]
+    assert state == {}  # 一時的な障害で初期化されない → 次回が初回として扱われる
+
+
+# --- メンテナンス（削除・停滞検知） -------------------------------------------
+
+CLEANUP_CONFIG = {
+    'settings': {
+        'notebook_title_format': 'Tech Radio {date}',
+        'cleanup': {'enabled': True, 'retention_days': 7, 'dry_run': False},
+    }
+}
+
+NOTEBOOKS = [
+    {'id': 'a', 'title': 'Tech Radio 2026-07-01'},  # 11日前 → 削除対象
+    {'id': 'b', 'title': 'Tech Radio 2026-07-10'},  # 2日前 → 保持
+    {'id': 'c', 'title': '手動で作った大事なノート'},  # 対象外
+    {'id': 'd', 'title': 'Tech Radio メモ'},  # 日付形式でない → 対象外
+    {'id': 'e', 'title': 'XTech Radio 2026-01-01Y'},  # 完全一致でない → 対象外
+]
+
+NOW = datetime.datetime(2026, 7, 12, 9, 0, tzinfo=rb.JST)
+
+
+@pytest.fixture
+def notebooklm_box(monkeypatch):
+    box = {'notebooks': NOTEBOOKS, 'deleted': [], 'posted': []}
+
+    def fake_cli(args, retries=1):
+        if args[0] == 'list':
+            return {'notebooks': box['notebooks']}
+        if args[0] == 'delete':
+            box['deleted'].append(args[2])
+            return {}
+        raise AssertionError(f'unexpected CLI call: {args}')
+
+    monkeypatch.setattr(rb, 'run_notebooklm_json', fake_cli)
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: box['posted'].append(payload))
+    return box
+
+
+def test_cleanup_deletes_only_old_batch_notebooks(notebooklm_box):
+    rb.cleanup_old_notebooks(CLEANUP_CONFIG, 'https://hooks.slack.com/x', now=NOW)
+    # 削除されるのは「バッチ命名かつ7日より古い」1件だけ。手動ノートには触れない
+    assert notebooklm_box['deleted'] == ['a']
+    assert 'Tech Radio 2026-07-01' in notebooklm_box['posted'][0]['text']
+
+
+def test_cleanup_matches_topic_titles_and_legacy_format(notebooklm_box):
+    """トピック入りの命名と分割前の旧命名は削除対象。設定にないトピック名は対象外のまま。"""
+    config = {
+        'feeds': [{'name': 'A', 'url': 'u1', 'topic': 'AI'}, {'name': 'B', 'url': 'u2', 'topic': 'Infra'}],
+        'settings': {
+            'notebook_title_format': 'Tech Radio {topic} {date}',
+            'cleanup': {
+                'enabled': True,
+                'retention_days': 7,
+                'dry_run': False,
+                'legacy_title_formats': ['Tech Radio {date}'],
+            },
+        },
+    }
+    notebooklm_box['notebooks'] = [
+        {'id': 'a', 'title': 'Tech Radio AI 2026-07-01'},  # 古い + 現行命名 → 削除
+        {'id': 'b', 'title': 'Tech Radio Infra 2026-07-01'},  # 古い + 現行命名 → 削除
+        {'id': 'c', 'title': 'Tech Radio 2026-07-01'},  # 古い + 旧命名 → 削除
+        {'id': 'd', 'title': 'Tech Radio AI 2026-07-11'},  # 新しい → 保持
+        {'id': 'e', 'title': 'Tech Radio Podcast 2026-07-01'},  # 設定にないトピック名 → 触らない
+    ]
+    rb.cleanup_old_notebooks(config, 'https://hooks.slack.com/x', now=NOW)
+    assert notebooklm_box['deleted'] == ['a', 'b', 'c']
+
+
+def test_cleanup_dry_run_deletes_nothing(notebooklm_box):
+    config = {'settings': {**CLEANUP_CONFIG['settings'], 'cleanup': {'enabled': True, 'dry_run': True}}}
+    rb.cleanup_old_notebooks(config, 'https://hooks.slack.com/x', now=NOW)
+    assert notebooklm_box['deleted'] == []
+    assert 'ドライラン' in notebooklm_box['posted'][0]['text']
+
+
+def test_cleanup_disabled_does_nothing(notebooklm_box):
+    rb.cleanup_old_notebooks({'settings': {}}, 'https://hooks.slack.com/x', now=NOW)
+    assert notebooklm_box['deleted'] == [] and notebooklm_box['posted'] == []
+
+
+def test_stale_feed_notified_only_on_first_of_month(notebooklm_box):
+    config = {'feeds': [{'name': 'Dead', 'url': FEED_URL}], 'settings': {}}
+    # 実時刻を基準にすると「1日時点での経過日数」が日々縮み、いつか閾値を割ってテストが落ちる。
+    # 判定される日(first)から遡って作ること。
+    first = datetime.datetime(2026, 8, 1, 9, 0, tzinfo=rb.JST)
+    old = (first - datetime.timedelta(days=40)).astimezone(UTC).isoformat()
+    state = {FEED_URL: {'watermark': old, 'recent_ids': [], 'last_new': old}}
+
+    rb.check_stale_feeds(config, state, 'https://hooks.slack.com/x', now=NOW)  # 12日 → 通知しない
+    assert notebooklm_box['posted'] == []
+
+    rb.check_stale_feeds(config, state, 'https://hooks.slack.com/x', now=first)
+    assert 'Dead' in notebooklm_box['posted'][0]['text']
+
+
+def test_dateless_only_feed_is_not_reprocessed(feed_box):
+    """日付なしフィード(claude.comのsitemap等)でも、処理済み記事が翌日再処理されない。"""
+    feed_box['feed'] = rb.SimpleNamespace(entries=[FakeEntry(i) for i in range(1, 4)])
+    state = {}
+    run_once(state, feed_box)  # 初回: 全既読化
+
+    feed_box['feed'].entries.append(FakeEntry(4))  # 新着(日付なし)
+    assert run_once(state, feed_box)[0] == ['記事4']
+    assert run_once(state, feed_box)[0] == []  # 翌日、同じ記事が再処理されないこと
+
+
+# --- 通知と音声プロンプト -----------------------------------------------------
+
+
+def test_notification_includes_article_urls(monkeypatch):
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    articles = [{'title': '新機能', 'link': 'https://example.com/post', 'feed_name': 'Example'}]
+    rb.send_notification('https://hooks.slack.com/x', articles)
+    assert 'https://example.com/post' in posted[0]['text']
+
+
+def test_notification_groups_by_topic_and_reports_blocked(monkeypatch):
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    articles = [
+        {'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F1', 'topic': 'AI'},
+        {'title': 'B', 'link': 'https://b.example/2', 'feed_name': 'F2', 'topic': 'Infra'},
+    ]
+    blocked = [('https://openai.example/3', 'Just a moment...')]
+    rb.send_notification('https://hooks.slack.com/x', articles, blocked)
+
+    text = posted[0]['text']
+    assert '《AI》' in text and '《Infra》' in text
+    assert 'ボット対策' in text and 'https://openai.example/3' in text
+
+
+def test_notification_with_only_blocked_articles(monkeypatch):
+    """全記事がボット対策ページだった場合も、「生成開始」とは言わずに警告だけ送る。"""
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    rb.send_notification('https://hooks.slack.com/x', [], [('https://openai.example/3', 'Just a moment...')])
+
+    text = posted[0]['text']
+    assert '生成を開始' not in text
+    assert 'ボット対策' in text
+
+
+# --- ボット対策ページ（Just a moment...）の検知 --------------------------------
+
+
+def make_source_cli(box):
+    def fake_cli(args, retries=1):
+        box['calls'].append(args)
+        if args[:2] == ['source', 'add']:
+            # URL投入は args[2] がURL、テキスト投入は本文なので --title（"記事名 | フィード名"）の記事名から引く
+            if '--type' in args:
+                title = next(a.split('=', 1)[1] for a in args if a.startswith('--title='))
+                return {'source': {'id': box['ids'][title.rsplit(' | ', 1)[0]]}}
+            return {'source': {'id': box['ids'][args[2]]}}
+        if args[:2] == ['source', 'list']:
+            return {'sources': box['sources']}
+        if args[:2] == ['source', 'delete']:
+            return {}
+        raise AssertionError(f'unexpected CLI call: {args}')
+
+    return fake_cli
+
+
+def article(link, title='記事', feed_name='Example', **kw):
+    return {'title': title, 'link': link, 'feed_name': feed_name, **kw}
+
+
+def test_junk_sources_are_removed_and_reported(monkeypatch):
+    box = {
+        'calls': [],
+        'ids': {'https://good.example/a': 'src-ok', 'https://openai.example/b': 'src-junk'},
+        'sources': [
+            {'id': 'src-ok', 'title': '良い記事のタイトル'},
+            {'id': 'src-junk', 'title': 'Just a moment...'},
+        ],
+    }
+    monkeypatch.setattr(rb, 'run_notebooklm_json', make_source_cli(box))
+    monkeypatch.setattr(rb.subprocess, 'run', lambda *a, **k: None)  # source wait は常に成功扱い
+
+    audio_ok, blocked = rb.add_sources_and_wait('nb1', [article(u) for u in box['ids']])
+
+    assert audio_ok == ['src-ok']  # 使えるソースが残っているので音声は生成する（-s に渡す ID）
+    assert blocked == [('https://openai.example/b', 'Just a moment...')]
+    # -y が無いと CI(TTY なし)で確認プロンプトが Abort になり、削除が成立しない
+    assert ['source', 'delete', 'src-junk', '-y', '--notebook', 'nb1'] in box['calls']
+
+
+def test_every_destructive_cli_call_skips_confirmation():
+    """削除系は必ず -y を渡す。付け忘れると CI では黙って削除に失敗する。"""
+    import inspect
+
+    src = inspect.getsource(rb)
+    for line in src.splitlines():
+        stripped = line.strip()
+        if "'delete'" not in stripped or stripped.startswith('#'):
+            continue
+        assert "'-y'" in stripped, f"削除呼び出しに -y がない: {stripped}"
+
+
+def test_all_junk_sources_skip_audio(monkeypatch):
+    box = {
+        'calls': [],
+        'ids': {'https://openai.example/b': 'src-junk'},
+        'sources': [{'id': 'src-junk', 'title': 'Attention Required! | Cloudflare'}],
+    }
+    monkeypatch.setattr(rb, 'run_notebooklm_json', make_source_cli(box))
+    monkeypatch.setattr(rb.subprocess, 'run', lambda *a, **k: None)
+
+    audio_ok, blocked = rb.add_sources_and_wait('nb1', [article(u) for u in box['ids']])
+
+    assert audio_ok == []  # 中身のあるソースがゼロなら音声を生成しない
+    assert len(blocked) == 1
+
+
+# --- テキスト投入モード (source_mode: text) -----------------------------------
+#
+# openai.com は Cloudflare のボット判定で記事ページが 403 を返し、NotebookLM が
+# 検証ページを掴む。記事URLではなくRSSの配信内容を投入して迂回する経路のテスト。
+
+
+TEXT_ARTICLE = {
+    'title': 'Launching Health in ChatGPT',
+    'link': 'https://openai.com/index/health-in-chatgpt',
+    'feed_name': 'OpenAI',
+    'topic': 'AI',
+    'source_mode': 'text',
+    'summary': 'Health in ChatGPT now lets eligible U.S. users connect medical records.',
+    'ts': datetime.datetime(2026, 7, 23, 0, 0, tzinfo=UTC),
+}
+
+
+def test_text_source_add_does_not_send_the_url(monkeypatch):
+    """テキスト投入では記事URLをCLIに渡さない（渡すとフェッチャーが検証ページを掴む）。"""
+    box = {'calls': [], 'ids': {'Launching Health in ChatGPT': 'src-text'}, 'sources': []}
+    monkeypatch.setattr(rb, 'run_notebooklm_json', make_source_cli(box))
+    monkeypatch.setattr(rb.subprocess, 'run', lambda *a, **k: None)
+
+    audio_ok, blocked = rb.add_sources_and_wait('nb1', [TEXT_ARTICLE])
+
+    add_call = next(c for c in box['calls'] if c[:2] == ['source', 'add'])
+    assert '--type' in add_call and add_call[add_call.index('--type') + 1] == 'text'
+    assert add_call[2] != TEXT_ARTICLE['link']  # 位置引数は本文であってURLではない
+    assert add_call[2].startswith('# ')
+    assert audio_ok and blocked == []
+
+
+def test_text_source_body_states_it_is_only_a_summary():
+    """ラジオが「全文を読んだ」前提で喋らないよう、要約である旨を本文冒頭に必ず入れる。"""
+    body = rb.build_text_source(TEXT_ARTICLE)
+
+    assert '記事の全文ではありません' in body
+    assert '推測で補わず' in body
+    assert TEXT_ARTICLE['summary'] in body
+    assert TEXT_ARTICLE['link'] in body  # 出典は辿れるように残す
+    assert '2026-07-23' in body
+
+
+def test_text_source_without_summary_says_title_only():
+    """RSSに要約すらない場合、「要約がある」ふりをしない。"""
+    body = rb.build_text_source({**TEXT_ARTICLE, 'summary': ''})
+    assert 'タイトルと公開日しか判明していません' in body
+
+
+def test_text_source_is_exempt_from_junk_detection(monkeypatch):
+    """こちらで付けたタイトルをボット対策ページと誤検知して消さない。"""
+    box = {
+        'calls': [],
+        'ids': {'Just a moment in AI history': 'src-text'},
+        'sources': [{'id': 'src-text', 'title': 'Just a moment in AI history'}],
+    }
+    monkeypatch.setattr(rb, 'run_notebooklm_json', make_source_cli(box))
+    monkeypatch.setattr(rb.subprocess, 'run', lambda *a, **k: None)
+
+    audio_ok, blocked = rb.add_sources_and_wait('nb1', [{**TEXT_ARTICLE, 'title': 'Just a moment in AI history'}])
+
+    assert blocked == []
+    assert audio_ok
+    assert not [c for c in box['calls'] if c[:2] == ['source', 'delete']]
+
+
+def test_text_and_url_sources_mix_in_one_notebook(monkeypatch):
+    """テキスト投入のフィードを足しても、他フィードのURL投入の挙動は変わらない。"""
+    box = {
+        'calls': [],
+        'ids': {'https://good.example/a': 'src-url', 'Launching Health in ChatGPT': 'src-text'},
+        'sources': [{'id': 'src-url', 'title': '良い記事'}, {'id': 'src-text', 'title': 'Launching Health in ChatGPT'}],
+    }
+    monkeypatch.setattr(rb, 'run_notebooklm_json', make_source_cli(box))
+    monkeypatch.setattr(rb.subprocess, 'run', lambda *a, **k: None)
+
+    audio_ok, blocked = rb.add_sources_and_wait('nb1', [article('https://good.example/a'), TEXT_ARTICLE])
+
+    adds = [c for c in box['calls'] if c[:2] == ['source', 'add']]
+    assert adds[0][2] == 'https://good.example/a' and '--type' not in adds[0]
+    assert '--type' in adds[1]
+    assert audio_ok and blocked == []
+
+
+def test_title_starting_with_dash_is_not_parsed_as_an_option():
+    args = rb.source_add_args({**TEXT_ARTICLE, 'title': '--force とは何か'}, 'nb1')
+    assert '--title=--force とは何か | OpenAI' in args
+
+
+def test_text_source_title_names_the_feed():
+    """変更履歴の "2.1.283" だけではソース一覧で何の話か分からないので、フィード名を添える。"""
+    args = rb.source_add_args({**TEXT_ARTICLE, 'title': '2.1.283', 'feed_name': 'Claude Code Changelog'}, 'nb1')
+    assert '--title=2.1.283 | Claude Code Changelog' in args
+
+
+# 変更履歴の RSS は 1 項目の全文を content:encoded で配信し、リンクは 1 枚のページの #アンカー。
+# URL を渡すとページ全体（全履歴）が項目数だけ重複して入るので、テキスト投入で項目の本文だけを入れる。
+CHANGELOG_ARTICLE = {
+    **TEXT_ARTICLE,
+    'title': '2.1.283',
+    'link': 'https://code.example/docs/changelog#2-1-283',
+    'feed_name': 'Claude Code Changelog',
+    'summary': 'Added deniedModels managed setting to block specific models',
+    'has_content': True,
+}
+
+
+def test_text_source_with_feed_content_says_it_is_the_feed_body():
+    """本文を配信しているフィードを「要約のみ」と書かない（ラジオが不要に口ごもる）。"""
+    body = rb.build_text_source(CHANGELOG_ARTICLE)
+
+    assert '配信されている本文' in body
+    assert '記事の全文ではありません' not in body
+    assert 'ボット対策' not in body  # 取り込めない理由はボット対策とは限らない
+    assert '推測で補わず' in body  # 本文でも「書いていないことは補わない」は残す
+    assert CHANGELOG_ARTICLE['summary'] in body
+
+
+def test_has_content_distinguishes_content_from_description(feed_box):
+    """content:encoded / Atom content は本文、description だけなら要約として運ぶ。"""
+    with_content = FakeEntry(1, datetime.datetime(2026, 9, 25, tzinfo=UTC))
+    with_content.content = [{'value': '<ul><li>Added deniedModels</li></ul>'}]
+    description_only = FakeEntry(2, datetime.datetime(2026, 9, 26, tzinfo=UTC))
+    description_only.summary = '<p>Short teaser</p>'
+    feed_box['feed'] = FakeFeed([description_only, with_content])
+    config = {'feeds': [{'name': 'Example', 'url': FEED_URL, 'source_mode': 'text'}]}
+
+    candidates, _, _ = rb.check_rss_feeds(
+        config, {'https://example.com/feed': {'watermark': '2026-09-01T00:00:00+00:00'}}
+    )
+
+    by_title = {a['title']: a for a in candidates}
+    assert by_title['記事1']['has_content'] is True
+    assert by_title['記事1']['summary'] == 'Added deniedModels'
+    assert by_title['記事2']['has_content'] is False
+
+
+def test_anchor_linked_description_counts_as_the_entry_body(feed_box):
+    """リンクが 1 ページ内の #アンカーなら、description でも項目の全文（Claude Platform のリリースノート）。"""
+    entry = FakeEntry(1, datetime.datetime(2026, 9, 24, tzinfo=UTC))
+    entry.link = 'https://docs.example/release-notes/overview#september-24-2026'
+    entry.summary = '<p>Launched Claude Opus 5.5 on the API.</p>'
+    feed_box['feed'] = FakeFeed([entry])
+    config = {'feeds': [{'name': 'Platform', 'url': FEED_URL, 'source_mode': 'text'}]}
+
+    candidates, _, _ = rb.check_rss_feeds(config, {})
+
+    assert candidates[0]['has_content'] is True
+    assert '記事の全文ではありません' not in rb.build_text_source(candidates[0])
+
+
+def test_notification_does_not_mark_feed_body_sources_as_summary_only(monkeypatch):
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    rb.send_notification('https://hooks.slack.com/x', [CHANGELOG_ARTICLE])
+
+    assert '要約のみ' not in posted[0]['text']
+
+
+def test_feed_source_mode_and_summary_reach_the_article(feed_box):
+    """config の source_mode と RSS の要約が記事dictまで運ばれる。"""
+    entry = FakeEntry(1, datetime.datetime(2026, 7, 1, tzinfo=UTC))
+    entry.summary = '<p>Hello &amp; <b>welcome</b></p>'
+    feed_box['feed'] = FakeFeed([entry])
+    config = {'feeds': [{'name': 'Example', 'url': FEED_URL, 'source_mode': 'text'}]}
+
+    candidates, _, _ = rb.check_rss_feeds(config, {})
+
+    assert candidates[0]['source_mode'] == 'text'
+    assert candidates[0]['summary'] == 'Hello & welcome'  # タグは落ちて実体参照は戻る
+
+
+def tagged(index, published, *terms):
+    entry = FakeEntry(index, published)
+    entry.tags = [{'term': t} for t in terms]
+    return entry
+
+
+def test_categories_keep_only_matching_entries(feed_box):
+    """categories で絞ると、一致しない記事は候補にも既読状態にも現れない（OpenAI の Company / Startup 等）。"""
+    config = {'feeds': [{'name': 'OpenAI', 'url': FEED_URL, 'categories': ['Product', 'Research']}]}
+    feed_box['feed'] = FakeFeed([tagged(1, BASE, 'Product')])
+    state = {}
+    run_once(state, feed_box, config)  # 初回
+
+    feed_box['feed'] = FakeFeed(
+        [
+            tagged(4, BASE + 3 * HOUR, 'Startup'),
+            tagged(3, BASE + 2 * HOUR, 'research'),  # 大文字小文字は区別しない
+            tagged(2, BASE + HOUR, 'Company', 'Global Affairs'),
+            tagged(1, BASE, 'Product'),
+        ]
+    )
+    assert run_once(state, feed_box, config)[0] == ['記事3']
+    assert run_once(state, feed_box, config)[0] == []
+
+
+def test_categories_matching_nothing_is_quiet_and_waits(feed_box):
+    """絞り込みに合う記事が表示範囲に無いだけなら、警告も既読化もしない。合う記事が現れた回を初回にする。"""
+    config = {'feeds': [{'name': 'OpenAI', 'url': FEED_URL, 'categories': ['Product']}]}
+    feed_box['feed'] = FakeFeed([tagged(1, BASE, 'Company')])
+    state = {}
+    titles, warnings = run_once(state, feed_box, config)
+    assert titles == [] and warnings == [] and FEED_URL not in state
+
+    feed_box['feed'] = FakeFeed([tagged(2, BASE + HOUR, 'Product'), tagged(1, BASE, 'Company')])
+    assert run_once(state, feed_box, config)[0] == ['記事2']
+
+
+def test_validate_categories():
+    base = {'feeds': [{'name': 'A', 'url': 'https://a.example/feed'}]}
+    bad = {'feeds': [{**base['feeds'][0], 'categories': 'Product'}]}
+    with pytest.raises(rb.ConfigError, match='categories'):
+        rb.validate_config(bad)
+    ok = {'feeds': [{**base['feeds'][0], 'categories': ['Product']}]}
+    assert rb.validate_config(ok) == []
+    sitemap = {
+        'feeds': [
+            {
+                'name': 'S',
+                'url': 'https://s.example/sitemap.xml',
+                'type': 'sitemap',
+                'prefix': 'https://s.example/',
+                'categories': ['X'],
+            }
+        ]
+    }
+    assert any('categories' in w for w in rb.validate_config(sitemap))
+
+
+def test_default_source_mode_is_url(feed_box):
+    candidates, _, _ = rb.check_rss_feeds(CONFIG, {})
+    assert candidates[0]['source_mode'] == 'url'
+    assert rb.source_add_args(candidates[0], 'nb1')[2] == candidates[0]['link']
+
+
+def test_notification_marks_summary_only_articles(monkeypatch):
+    """要約しか入っていない記事は、Slack上でもそうと分かるようにする。"""
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    rb.send_notification('https://hooks.slack.com/x', [TEXT_ARTICLE, article('https://a.example/1', feed_name='F1')])
+
+    text = posted[0]['text']
+    assert 'OpenAI・要約のみ' in text
+    assert '（F1）' in text  # 通常のURL投入分には印を付けない
+
+
+def test_generate_audio_passes_prompt_and_length(monkeypatch):
+    calls = []
+    monkeypatch.setattr(rb, 'run_notebooklm_json', lambda args, retries=1: calls.append(args) or {'status': 'pending'})
+    rb.generate_audio('nb1', language='ja', prompt='対談形式で', length='long')
+    args = calls[0]
+    assert args[:3] == ['generate', 'audio', '--no-wait']
+    assert args[-1] == '対談形式で' and '--length' in args and 'long' in args
+
+
+def test_notification_includes_notebook_link(monkeypatch):
+    """通知からノートブックへ直接飛べる（命名規則からアプリ内で探させない）。"""
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    articles = [{'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F1', 'topic': 'AI'}]
+    notebooks = {'AI': ('Tech Radio AI 2026-09-25', 'nb-123')}
+    rb.send_notification('https://hooks.slack.com/x', articles, notebooks=notebooks)
+    text = posted[0]['text']
+    assert 'https://notebooklm.google.com/notebook/nb-123' in text and 'Tech Radio AI 2026-09-25' in text
+    assert '開始したよ' in text
+
+
+def test_notification_does_not_claim_audio_started_when_it_did_not(monkeypatch):
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    articles = [{'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F1', 'topic': 'AI'}]
+    rb.send_notification('https://hooks.slack.com/x', articles, no_audio={'AI'})
+    text = posted[0]['text']
+    assert '開始したよ' not in text and '音声は未生成' in text
+
+
+def test_audio_failure_marks_articles_read_and_reports(monkeypatch):
+    """音声生成が失敗してもソースは入っているので、記事は既読にし、失敗は別枠で報告する。
+
+    未読のまま残すと次回また同じ URL を投入して重複するだけ。CLI の封筒（rate_limited 等）が
+    通知に載ること。
+    """
+    art = {'id': 'a1', 'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F', 'topic': 'AI', 'ts': None}
+    monkeypatch.setattr(
+        rb, 'load_config', lambda: {'feeds': [{'name': 'F', 'url': 'https://f.example/feed'}], 'settings': {}}
+    )
+    monkeypatch.setattr(rb, 'load_state', lambda: {})
+    monkeypatch.setattr(rb, 'save_state', lambda state: None)
+    monkeypatch.setattr(rb, 'check_rss_feeds', lambda config, state: ([art], [], []))
+    monkeypatch.setattr(rb, 'check_watch_pages', lambda config, state, url: [])
+    monkeypatch.setattr(rb, 'get_or_create_notebook', lambda title: 'nb1')
+    monkeypatch.setattr(rb, 'add_sources_and_wait', lambda nb, arts: (['src-1'], []))
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py'])
+    monkeypatch.setattr(rb, 'run_maintenance', lambda *a: None)
+
+    def fail(*a, **kw):
+        stdout = '{"error": true, "code": "rate_limited", "message": "Daily quota may be exceeded"}'
+        raise subprocess.CalledProcessError(1, ['notebooklm', 'generate', 'audio'], output=stdout)
+
+    monkeypatch.setattr(rb, 'generate_audio', fail)
+    advanced = []
+    monkeypatch.setattr(rb, 'advance_state', lambda state, results, processed, now=None: advanced.extend(processed))
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    monkeypatch.setenv('NOTIFY_WEBHOOK_URL', 'https://hooks.slack.com/x')
+
+    with pytest.raises(SystemExit) as exc:
+        rb.main()
+    assert exc.value.code == 1
+    assert advanced == [art]  # 既読にする
+    dumped = json.dumps(posted, ensure_ascii=False)
+    assert 'rate_limited' in dumped and '音声は未生成' in dumped and 'nb1' in dumped
+
+
+# --- 失敗の説明文（Slack へ出す中身） -----------------------------------------
+
+AUTH_EXPIRED_STDOUT = (
+    '{\n'
+    '  "error": true,\n'
+    '  "code": "UNEXPECTED_ERROR",\n'
+    '  "message": "Unexpected error: Authentication expired or invalid. '
+    'Redirected to: https://accounts.google.com/<redacted>\\nRun \'notebooklm login\' to re-authenticate."\n'
+    '}\n'
+)
+
+
+def _cli_failure(stdout, returncode=2):
+    return subprocess.CalledProcessError(returncode, ['notebooklm', 'list', '--json'], output=stdout, stderr='')
+
+
+def test_auth_expiry_is_named_instead_of_a_bare_exit_code():
+    """exit 2 だけでは認証切れとバグの区別がつかない。code と message を必ず添える。"""
+    msg = rb.describe_failure(_cli_failure(AUTH_EXPIRED_STDOUT))
+
+    assert 'Exit code: 2' in msg
+    assert 'UNEXPECTED_ERROR' in msg
+    assert 'Authentication expired or invalid' in msg
+    # 復旧手順まで出す（次に落ちた人がそのまま実行できること）
+    assert 'scripts/setup.py renew' in msg
+    assert 'gh secret set NOTEBOOKLM_AUTH_JSON' in msg
+    # CI 専用プロファイルを案内すること。default を押し戻すと分離が無意味になる
+    assert 'notebooklm -p ci login' in msg
+    assert 'profiles/ci/storage_state.json' in msg
+    assert 'profiles/default' not in msg
+
+
+def test_csrf_flavor_of_expiry_also_gets_the_runbook():
+    """失効したセッションは「CSRF トークンが無い」という形でも出る（2026-10-02〜05 に 4 回）。
+
+    message は "page structure has changed" と言うのでバグに見えるが、同じ CLI でも新しくログインした
+    プロファイルなら通った。復旧手順が付かなかったので、通知を見ても認証切れと分からなかった。
+    """
+    stdout = (
+        '{"error": true, "code": "UNEXPECTED_ERROR", "message": "Unexpected error: CSRF token not found in HTML. '
+        'Final URL: https://notebook.google.com/\\nThis may indicate the page structure has changed."}'
+    )
+    msg = rb.describe_failure(_cli_failure(stdout))
+
+    assert 'CSRF token not found' in msg
+    assert 'scripts/setup.py renew' in msg
+    assert 'notebooklm -p ci login' in msg
+
+
+def test_non_auth_cli_error_reports_code_without_the_auth_hint():
+    stdout = '{"error": true, "code": "NOT_FOUND", "message": "Notebook abc not found"}'
+    msg = rb.describe_failure(_cli_failure(stdout, returncode=1))
+
+    assert 'NOT_FOUND: Notebook abc not found' in msg
+    assert 'gh secret set' not in msg
+
+
+def test_unparsable_cli_output_falls_back_to_exit_code():
+    """封筒が読めないときに例外を出さず、従来どおりの情報で通知できること。"""
+    for stdout in ('Just some plain text', '', None, '{"not": "an envelope"}', '[1, 2, 3]'):
+        msg = rb.describe_failure(_cli_failure(stdout))
+        assert msg.startswith('NotebookLM command failed.')
+        assert 'Exit code: 2' in msg
+
+
+def test_raw_cli_output_is_never_copied_into_the_message():
+    """封筒の既知フィールドだけを拾う。未知フィールドはクッキーを運びうるので載せない。"""
+    stdout = (
+        '{"error": true, "code": "RPC_ERROR", "message": "boom", '
+        '"response_body": "__Secure-1PSID=SUPERSECRETCOOKIEVALUE"}'
+    )
+    msg = rb.describe_failure(_cli_failure(stdout))
+
+    assert 'RPC_ERROR: boom' in msg
+    assert 'SUPERSECRETCOOKIEVALUE' not in msg
+    assert 'response_body' not in msg
+
+
+def test_non_subprocess_exception_keeps_its_type_name():
+    assert rb.describe_failure(ValueError('boom')) == 'ValueError: boom'
+
+
+def test_timeout_does_not_masquerade_as_a_cli_error():
+    e = subprocess.TimeoutExpired(['notebooklm', 'list', '--json'], 300)
+    msg = rb.describe_failure(e)
+
+    assert msg.startswith('TimeoutExpired:')
+    assert 'Exit code' not in msg
+
+
+# --- 設定の検査（validate_config / --check-config） ----------------------------------
+
+VALID_CONFIG = {
+    'feeds': [
+        {'name': 'A', 'url': 'https://a.example/feed', 'topic': 'AI'},
+        {
+            'name': 'S',
+            'url': 'https://s.example/sitemap.xml',
+            'type': 'sitemap',
+            'prefix': 'https://s.example/news/',
+            'topic': 'Infra',
+        },
+    ],
+    'topics': {'AI': {'audio': {'format': 'deep-dive', 'length': 'long'}}},
+    'settings': {
+        'notebook_title_format': 'Tech Radio {topic} {date}',
+        'language': 'ja',
+        'timezone': 'Asia/Tokyo',
+        'limits': {'per_feed': 3, 'total': 15},
+        'audio': {'length': 'long', 'prompt': 'x'},
+        'cleanup': {'enabled': True, 'retention_days': 7, 'dry_run': True},
+    },
+}
+
+
+def _invalid(mutate):
+    config = copy.deepcopy(VALID_CONFIG)
+    mutate(config)
+    with pytest.raises(rb.ConfigError) as exc:
+        rb.validate_config(config)
+    return str(exc.value)
+
+
+def test_shipped_config_is_valid():
+    """リポジトリの config.yaml 自体が検査を通る（警告もなし）。"""
+    assert rb.validate_config(rb.load_config()) == []
+
+
+def test_valid_config_passes():
+    assert rb.validate_config(copy.deepcopy(VALID_CONFIG)) == []
+
+
+def test_validate_rejects_top_level_typo():
+    """`feed:` と書くと全件消えて「新着なし」に見える。黙って通さない。"""
+    msg = _invalid(lambda c: c.update(feed=c.pop('feeds')))
+    assert '不明なキー `feed`' in msg and '`feeds:`' in msg
+
+
+def test_validate_rejects_feed_key_typo():
+    msg = _invalid(lambda c: c['feeds'][0].update(topics='AI'))
+    assert 'feeds[1] (A)' in msg and '`topics`' in msg
+
+
+def test_validate_requires_prefix_for_sitemap():
+    msg = _invalid(lambda c: c['feeds'][1].pop('prefix'))
+    assert 'prefix' in msg
+
+
+def test_validate_rejects_duplicate_feed_url():
+    msg = _invalid(lambda c: c['feeds'].append({'name': 'A2', 'url': 'https://a.example/feed'}))
+    assert '重複' in msg
+
+
+def test_validate_rejects_topic_list():
+    msg = _invalid(lambda c: c['feeds'][0].update(topic=['AI', 'Infra']))
+    assert '`topic` は文字列 1 つ' in msg
+
+
+def test_validate_requires_date_placeholder():
+    msg = _invalid(lambda c: c['settings'].update(notebook_title_format='Tech Radio {topic}'))
+    assert '{date}' in msg
+
+
+def test_validate_rejects_unknown_placeholder():
+    msg = _invalid(lambda c: c['settings'].update(notebook_title_format='Radio {foo} {date}'))
+    assert '{foo}' in msg
+
+
+def test_validate_rejects_bad_enums_and_timezone():
+    def mutate(c):
+        c['settings']['audio']['format'] = 'podcast'
+        c['settings']['timezone'] = 'Mars/Olympus'
+
+    msg = _invalid(mutate)
+    assert 'settings.audio.format' in msg and 'settings.timezone' in msg
+
+
+def test_validate_collects_all_errors_at_once():
+    def mutate(c):
+        c['feeds'][0].pop('url')
+        c['settings']['limits']['per_feed'] = 0
+
+    msg = _invalid(mutate)
+    assert '`url` が必要' in msg and 'limits.per_feed' in msg
+
+
+def test_validate_warns_without_failing():
+    config = copy.deepcopy(VALID_CONFIG)
+    config['topics']['Unused'] = {'audio': {'format': 'brief'}}
+    config['feeds'][1]['mode'] = 'latest'  # sitemap では無視される
+    warnings = rb.validate_config(config)
+    assert any('Unused' in w for w in warnings) and any('latest' in w for w in warnings)
+
+
+def test_check_config_flag_has_no_side_effects(monkeypatch, capsys):
+    monkeypatch.setattr(rb, 'load_config', lambda: copy.deepcopy(VALID_CONFIG))
+    monkeypatch.setattr(rb, 'load_state', lambda: pytest.fail('state must not be read'))
+    monkeypatch.setattr(rb, 'check_rss_feeds', lambda *a: pytest.fail('feeds must not be fetched'))
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py', '--check-config'])
+    with pytest.raises(SystemExit) as exc:
+        rb.main()
+    assert exc.value.code == 0
+    assert 'config.yaml OK' in capsys.readouterr().out
+
+
+def test_broken_config_is_reported_not_swallowed(monkeypatch):
+    """壊れた config は Actions ログだけでなく通知にも出る（以前は try の外で落ちて沈黙していた）。"""
+    monkeypatch.setattr(rb, 'load_config', lambda: {'feed': []})
+    posted = []
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: posted.append(payload))
+    monkeypatch.setenv('NOTIFY_WEBHOOK_URL', 'https://hooks.slack.com/x')
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py'])
+    with pytest.raises(SystemExit) as exc:
+        rb.main()
+    assert exc.value.code == 1
+    assert 'ConfigError' in json.dumps(posted, ensure_ascii=False)
+
+
+# --- トピック別の音声設定と差分エピソード ----------------------------------------------
+
+
+def test_audio_settings_topic_overrides_global():
+    config = {
+        'settings': {'language': 'ja', 'audio': {'length': 'long', 'prompt': '全体'}},
+        'topics': {'Infra': {'audio': {'format': 'brief', 'length': 'default'}}},
+    }
+    assert rb.audio_settings_for(config, 'Infra') == {
+        'language': 'ja',
+        'length': 'default',
+        'prompt': '全体',
+        'format': 'brief',
+    }
+    # topics に無いトピックは全体設定のまま
+    assert rb.audio_settings_for(config, 'AI') == {'language': 'ja', 'length': 'long', 'prompt': '全体'}
+
+
+def test_generate_audio_passes_format_and_source_scope(monkeypatch):
+    calls = []
+    monkeypatch.setattr(rb, 'run_notebooklm_json', lambda args, retries=1: calls.append(args) or {'status': 'pending'})
+    rb.generate_audio('nb1', language='en', prompt='p', length='short', fmt='debate', source_ids=['s1', 's2'])
+    args = calls[0]
+    assert args[args.index('--format') + 1] == 'debate'
+    assert [args[i + 1] for i, a in enumerate(args) if a == '-s'] == ['s1', 's2']
+    assert args[-1] == 'p'
+
+
+def test_add_sources_excludes_unready_and_junk_from_usable_ids(monkeypatch):
+    """-s に渡す ID は「読み込みが完了し、ジャンクでもない」ものだけ。"""
+    box = {
+        'calls': [],
+        'ids': {
+            'https://good.example/a': 'src-ok',
+            'https://slow.example/c': 'src-slow',
+            'https://openai.example/b': 'src-junk',
+        },
+        'sources': [
+            {'id': 'src-ok', 'title': '良い記事'},
+            {'id': 'src-slow', 'title': '遅い記事'},
+            {'id': 'src-junk', 'title': 'Just a moment...'},
+        ],
+    }
+    monkeypatch.setattr(rb, 'run_notebooklm_json', make_source_cli(box))
+
+    def wait(cmd, **kw):
+        if cmd[3] == 'src-slow':  # ['notebooklm', 'source', 'wait', <id>, ...]
+            raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(rb.subprocess, 'run', wait)
+    usable, blocked = rb.add_sources_and_wait('nb1', [article(u) for u in box['ids']])
+    assert usable == ['src-ok']
+    assert blocked == [('https://openai.example/b', 'Just a moment...')]
+
+
+def test_main_scopes_audio_to_this_runs_sources(monkeypatch):
+    """夕方の回は夕方に入れた記事だけで音声を作る（scope: run が既定）。"""
+    art = {'id': 'a1', 'title': 'A', 'link': 'https://a.example/1', 'feed_name': 'F', 'topic': 'Infra', 'ts': None}
+    config = {
+        'feeds': [{'name': 'F', 'url': 'https://f.example/feed'}],
+        'settings': {'language': 'ja'},
+        'topics': {'Infra': {'audio': {'format': 'brief'}}},
+    }
+    monkeypatch.setattr(rb, 'load_config', lambda: config)
+    monkeypatch.setattr(rb, 'load_state', lambda: {})
+    monkeypatch.setattr(rb, 'save_state', lambda state: None)
+    monkeypatch.setattr(rb, 'check_rss_feeds', lambda config, state: ([art], [], []))
+    monkeypatch.setattr(rb, 'check_watch_pages', lambda config, state, url: [])
+    monkeypatch.setattr(rb, 'get_or_create_notebook', lambda title: 'nb1')
+    monkeypatch.setattr(rb, 'add_sources_and_wait', lambda nb, arts: (['src-new'], []))
+    monkeypatch.setattr(rb, 'run_maintenance', lambda *a: None)
+    monkeypatch.setattr(rb, 'advance_state', lambda *a, **k: None)
+    monkeypatch.setattr(rb, '_post_webhook', lambda url, payload, label: None)
+    calls = []
+    monkeypatch.setattr(rb, 'generate_audio', lambda *a, **kw: calls.append(kw))
+    monkeypatch.setattr(sys, 'argv', ['radio_batch.py'])
+
+    rb.main()
+    assert calls == [{'language': 'ja', 'prompt': None, 'length': None, 'fmt': 'brief', 'source_ids': ['src-new']}]
+
+
+# --- mode: latest（アグリゲータ向け、フィード単位のオプトイン） -----------------------------
+
+
+def test_latest_mode_takes_newest_and_marks_rest_read(feed_box):
+    """最新 N 件だけ拾い、残りは意図的に既読にする。「処理していない記事を既読にしない」の明示的な例外。"""
+    config = {'feeds': [{'name': 'Agg', 'url': FEED_URL, 'mode': 'latest'}]}
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box, config)  # 初回
+
+    feed_box['feed'] = make_feed(30)  # 20 件の新着
+    titles, _ = run_once(state, feed_box, config)
+    assert titles == ['記事28', '記事29', '記事30']  # 最新 3 件（古い順に並ぶ）
+    assert run_once(state, feed_box, config)[0] == []  # 残り 17 件は既読扱い
+
+
+def test_latest_mode_keeps_state_when_nothing_was_processed(feed_box):
+    """トピックが失敗して何も処理できなかった回は既読を進めず、次回また最新を拾い直す。"""
+    config = {'feeds': [{'name': 'Agg', 'url': FEED_URL, 'mode': 'latest'}]}
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box, config)
+    before = dict(state[FEED_URL])
+
+    feed_box['feed'] = make_feed(30)
+    _candidates, results, _ = rb.check_rss_feeds(config, state)
+    rb.advance_state(state, results, [])
+    assert state[FEED_URL] == before
+    assert run_once(state, feed_box, config)[0] == ['記事28', '記事29', '記事30']
+
+
+def test_latest_mode_articles_survive_total_cap(feed_box, monkeypatch):
+    """latest 分は最新記事なので、古い順に切る全体上限で真っ先に落ちないよう常に通す。"""
+    monkeypatch.setattr(rb, 'MAX_ARTICLES_TOTAL', 4)
+    config = {
+        'feeds': [
+            {'name': 'Old', 'url': 'https://old.example/feed'},
+            {'name': 'Agg', 'url': FEED_URL, 'mode': 'latest'},
+        ]
+    }
+    feed_box['feed'] = make_feed(10)
+    state = {}
+    run_once(state, feed_box, config)
+
+    feed_box['feed'] = make_feed(30)
+    titles, _ = run_once(state, feed_box, config)
+    assert len(titles) == 4 and {'記事28', '記事29', '記事30'} <= set(titles)
+
+
+def test_latest_mode_is_ignored_for_sitemaps(monkeypatch):
+    """sitemap は seen-set で毎回全件を見るので latest の出番がない（検査が警告するだけ）。"""
+    warnings = rb.validate_config(
+        {
+            'feeds': [
+                {
+                    'name': 'S',
+                    'url': 'https://s.example/sitemap.xml',
+                    'type': 'sitemap',
+                    'prefix': 'https://s.example/',
+                    'mode': 'latest',
+                }
+            ]
+        }
+    )
+    assert warnings and 'latest' in warnings[0]
+
+
+# --- cleanup は topics: セクションの名前も候補にする ------------------------------------------
+
+
+def test_cleanup_matches_topics_section_names(notebooklm_box):
+    config = {
+        'feeds': [{'name': 'F', 'url': 'https://f.example/feed'}],
+        'topics': {'Security': None},
+        'settings': {
+            'notebook_title_format': 'Tech Radio {topic} {date}',
+            'cleanup': {'enabled': True, 'retention_days': 7, 'dry_run': False},
+        },
+    }
+    notebooklm_box['notebooks'] = [
+        {'id': 'a', 'title': 'Tech Radio Security 2026-07-01'},  # topics: にだけある名前 → 削除
+        {'id': 'b', 'title': 'Tech Radio Podcast 2026-07-01'},  # どこにもない名前 → 触らない
+    ]
+    rb.cleanup_old_notebooks(config, 'https://hooks.slack.com/x', now=NOW)
+    assert notebooklm_box['deleted'] == ['a']
+
+
+# --- 設定ビルダー（tech-feed-catalog）の出力と、この検査の互換性を固定する -----------------
+
+
+def test_builder_output_fixture_is_valid():
+    """https://inoueuj.github.io/tech-feed-catalog/ が生成した config.yaml をそのまま受け付ける。
+
+    ビルダーの出力形式を変えたら tests/fixtures/builder_output.yaml も更新すること。
+    トピック名が日本語（引用符付きキー）、mode: latest、source_mode: text、topics: の上書きを含む。
+    """
+    import os
+
+    path = os.path.join(os.path.dirname(__file__), 'fixtures', 'builder_output.yaml')
+    with open(path, encoding='utf-8') as f:
+        config = rb.yaml.safe_load(f)
+    assert rb.validate_config(config) == []
+    assert rb.audio_settings_for(config, 'Changelog')['format'] == 'brief'
+    assert rb.audio_settings_for(config, 'ニュース')['language'] == 'ja'
+    assert [f['name'] for f in config['feeds'] if f.get('mode') == 'latest'] == [
+        'Vercel Changelog',
+        'Hacker News Front Page',
+    ]

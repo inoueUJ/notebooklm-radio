@@ -1,0 +1,1822 @@
+import datetime
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import Counter
+from types import SimpleNamespace
+from urllib.parse import urldefrag, urlparse
+from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
+
+import feedparser
+import httpx
+import yaml
+
+# パス設定
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, 'config.yaml')
+STATE_PATH = os.path.join(BASE_DIR, 'state.json')
+
+JST = ZoneInfo('Asia/Tokyo')
+# ノートブックの日付や月次判定に使うタイムゾーン。settings.timezone で上書きできる。
+# runner は UTC なので、ここを経由しないと朝の回のノートブックが前日名になる。
+LOCAL_TZ = JST
+UTC = datetime.UTC
+EPOCH = datetime.datetime(1970, 1, 1, tzinfo=UTC)
+
+# 1回の実行で1フィードから処理する記事数の上限（settings.limits.per_feed で上書き可）
+MAX_ARTICLES_PER_FEED = 3
+# 1回の実行で処理する記事数の全体上限（settings.limits.total で上書き可）。
+# 記事ごとに source wait が直列で走るため、上げすぎると30分タイムアウトを圧迫する。
+MAX_ARTICLES_TOTAL = 15
+# 処理済みとして覚えておく ID の数（透かしだけでは既読を判定できない記事の分は、これを超えても消さない）
+MAX_RECENT_IDS = 200
+# 透かしより前の日付で「後から」差し込まれる記事を拾うための振り返り幅。
+# フィードは公開順に並ぶとは限らず、前日付の記事が数時間〜数日遅れて現れる
+# （2026-09 の実測: OpenAI・Cloudflare Changelog・Vercel・GitHub で 7 日間に 14 件。
+# 遅れは最大 2 日強）。透かしだけだと、現れた時点で既読扱いになり一度も放送されない。
+LOOKBACK = datetime.timedelta(days=7)
+# sitemap の記事はフィードから押し出されない（毎回全 URL が返る）。全体上限の並べ替えで最後に回す
+NEVER_SCROLLS_OUT = 10**9
+# 鮮度の足切り（settings.max_age_hours で指定。既定は無効）。公開からこの時間を過ぎた記事は流さずに既読にし、
+# Slack に一覧だけ出す。朝に整理された最新情報を聞くためのラジオで、障害明けに 2 週間前のニュースを流して
+# いた（2026-09 前半、公開から放送まで中央値 14.5 日）ことへの対策。
+MAX_AGE_HOURS = None
+# 見送った記事の通知に並べる件数（障害明けは多くなるので先頭だけ）
+STALE_LIST_MAX = 10
+# sitemap で一度にこの件数（かつ全 URL の半分）を超えて未読になったら、記事が増えたのではなく
+# URL の形式が変わったとみなす（antigravity.google が 2026-09 に末尾の / を付け、全記事が新着に見えた）
+SITEMAP_REBASELINE_MIN = 5
+# フィードに見えている記事がこの件数以上あって全部未読なら、表示範囲から押し出された記事があるかもしれないと警告する
+# （2026-09 前半、GitHub Changelog は 10 件すべて未読のまま 30 回続き、152 件中 101 件を失っていた）
+WINDOW_WARN_MIN = 5
+# state.json に残す直近の実行記録の数。週 1 回の点検（scripts/weekly_check.py）が「何を流したか」を知るために使う
+RUNS_KEY = '_runs'
+MAX_RUN_HISTORY = 30
+# 週 1 回の取りこぼし検査（Deep Research）用のノートブックのトピック名。古くなったら掃除の対象にする
+RECALL_TOPIC = 'Recall'
+# feed に topic が指定されていない場合の行き先ノートブック（settings.default_topic で上書き可）
+DEFAULT_TOPIC = 'AI'
+
+# feed の source_mode。既定は 'url'（記事URLを渡して NotebookLM に取得させる）。
+# 'text' は記事URLを渡さず、RSSの配信内容をこちら側でMarkdown化して投入するモード。
+# 記事URLをそのまま渡すと中身が正しく入らないフィード向けで、理由は2種類ある:
+# - openai.com のように Cloudflare のボット判定で記事ページが 403 (cf-mitigated: challenge)
+#   を返すホスト。相手側の判定なのでリトライでは通らず、フェッチャーを迂回するしかない。
+# - 変更履歴の RSS のように、リンクが 1 枚の長いページの #アンカーになっているフィード。
+#   NotebookLM は # 以降を無視してページ全体を取り込むので、1 項目のつもりが全履歴になり、
+#   同じページが項目数だけ重複して入る（Codex changelog で 1 冊に 3 重）。
+TEXT_SOURCE_MODE = 'text'
+
+# ボット対策ページを掴まされたソースのタイトル (Cloudflare "Just a moment..." 等)。
+# source add は成功するのに中身は検証ページ、という検知しづらい失敗を拾うための判定。
+JUNK_TITLE_RE = re.compile(
+    r'just a moment|attention required|access denied|verify you are human|enable javascript|are you a robot',
+    re.IGNORECASE,
+)
+
+FEED_TIMEOUT = 30.0
+NOTEBOOKLM_TIMEOUT = 300
+SOURCE_WAIT_TIMEOUT = 600
+# フィード取得時に名乗る User-Agent（settings.user_agent で上書き可）。
+# 既定はこのソフトウェアのホームページを指す。fork 運用なら自分のリポジトリを名乗るとよい。
+USER_AGENT = 'notebooklm-radio/1.0 (+https://github.com/inoueUJ/notebooklm-radio)'
+
+
+def load_config():
+    with open(CONFIG_PATH, encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+
+def apply_settings_overrides(config):
+    """config の settings でモジュール既定値を上書きする。main() の冒頭で一度だけ呼ぶ。
+
+    テストは各関数を直接呼ぶ（main を通らない）ので、既定値がそのまま使われる。
+    上書き対象を増やしたら config.schema.json と config.yaml のコメントも更新すること。
+    """
+    global LOCAL_TZ, DEFAULT_TOPIC, MAX_ARTICLES_PER_FEED, MAX_ARTICLES_TOTAL, USER_AGENT, MAX_AGE_HOURS
+    settings = (config or {}).get('settings') or {}
+    if settings.get('timezone'):
+        LOCAL_TZ = ZoneInfo(settings['timezone'])
+    DEFAULT_TOPIC = settings.get('default_topic', DEFAULT_TOPIC)
+    limits = settings.get('limits') or {}
+    MAX_ARTICLES_PER_FEED = int(limits.get('per_feed', MAX_ARTICLES_PER_FEED))
+    MAX_ARTICLES_TOTAL = int(limits.get('total', MAX_ARTICLES_TOTAL))
+    USER_AGENT = settings.get('user_agent', USER_AGENT)
+    MAX_AGE_HOURS = settings.get('max_age_hours', MAX_AGE_HOURS)
+
+
+class ConfigError(ValueError):
+    """config.yaml の内容が不正。実行前に止めて、何が悪いかを通知に載せる。"""
+
+
+# config.yaml で受け付けるキー。config.schema.json（ビルダー用の型定義）と同じ規則。
+TOP_KEYS = {'feeds', 'topics', 'watch', 'settings', 'weekly_check'}
+WEEKLY_CHECK_KEYS = {'recall', 'recall_query'}
+FEED_KEYS = {'name', 'url', 'type', 'prefix', 'topic', 'source_mode', 'mode', 'categories'}
+TOPIC_KEYS = {'audio'}
+WATCH_KEYS = {'name', 'url', 'prefix', 'keywords'}
+SETTINGS_KEYS = {
+    'notebook_title_format',
+    'language',
+    'timezone',
+    'default_topic',
+    'limits',
+    'user_agent',
+    'audio',
+    'cleanup',
+    'stale_feed_days',
+    'max_age_hours',
+}
+LIMITS_KEYS = {'per_feed', 'total'}
+AUDIO_KEYS = {'length', 'format', 'prompt', 'scope', 'language'}
+CLEANUP_KEYS = {'enabled', 'retention_days', 'dry_run', 'legacy_title_formats'}
+FEED_TYPES = {'rss', 'sitemap'}
+SOURCE_MODES = {'url', TEXT_SOURCE_MODE}
+FEED_MODES = {'backlog', 'latest'}
+AUDIO_LENGTHS = {'short', 'default', 'long'}
+AUDIO_FORMATS = {'deep-dive', 'brief', 'critique', 'debate'}
+AUDIO_SCOPES = {'run', 'notebook'}
+
+
+def _validate_audio(audio, where, errors):
+    if audio is None:
+        return
+    if not isinstance(audio, dict):
+        errors.append(f"{where}: マッピング（length / format / prompt / scope / language）である必要がある")
+        return
+    for key in sorted(set(audio) - AUDIO_KEYS):
+        errors.append(f"{where}: 不明なキー `{key}`")
+    for key, allowed in (('length', AUDIO_LENGTHS), ('format', AUDIO_FORMATS), ('scope', AUDIO_SCOPES)):
+        if key in audio and audio[key] not in allowed:
+            errors.append(f"{where}.{key}: {sorted(allowed)} のいずれか（実際: {audio[key]!r}）")
+    for key in ('prompt', 'language'):
+        if key in audio and not isinstance(audio[key], str):
+            errors.append(f"{where}.{key}: 文字列である必要がある")
+
+
+def _positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def validate_config(config):
+    """config.yaml を実行前に検査する。致命的な問題は ConfigError にまとめて投げ、注意点は文字列の一覧で返す。
+
+    typo が黙って既定値に落ちるのが一番怖い（`feed:` と書くと全件消えて「新着なし」に見える、
+    `topics:` をフィード内に書くと既定トピックに流れる）ので、未知のキーはエラーにする。
+    ネットワークにも NotebookLM にも触れない。`--check-config` と CI の検査ステップから呼ばれる。
+    """
+    errors, warnings = [], []
+    if not isinstance(config, dict):
+        raise ConfigError('config.yaml のトップレベルはマッピング（feeds: / settings: ...）である必要がある')
+
+    def unknown(keys, allowed, where):
+        for key in sorted(set(keys) - allowed):
+            errors.append(f"{where}: 不明なキー `{key}`")
+
+    unknown(config.keys(), TOP_KEYS, 'トップレベル')
+    settings = config.get('settings') or {}
+    if not isinstance(settings, dict):
+        errors.append('`settings:` はマッピングである必要がある')
+        settings = {}
+    default_topic = settings.get('default_topic', DEFAULT_TOPIC)
+
+    feeds = config.get('feeds')
+    if not isinstance(feeds, list) or not feeds:
+        errors.append('`feeds:` にフィードを 1 つ以上書く必要がある')
+        feeds = []
+    feed_topics = set()
+    seen_keys = {}
+    for i, feed in enumerate(feeds, 1):
+        where = f"feeds[{i}]"
+        if not isinstance(feed, dict):
+            errors.append(f"{where}: マッピング（name: / url: ...）である必要がある")
+            continue
+        if isinstance(feed.get('name'), str) and feed['name']:
+            where += f" ({feed['name']})"
+        unknown(feed.keys(), FEED_KEYS, where)
+        for required in ('name', 'url'):
+            if not isinstance(feed.get(required), str) or not feed[required]:
+                errors.append(f"{where}: `{required}` が必要")
+        ftype = feed.get('type', 'rss')
+        if ftype not in FEED_TYPES:
+            errors.append(f"{where}: `type` は {sorted(FEED_TYPES)} のいずれか（実際: {ftype!r}）")
+        if ftype == 'sitemap' and not isinstance(feed.get('prefix'), str):
+            errors.append(f"{where}: `type: sitemap` には `prefix`（記事 URL の先頭）が必要")
+        if ftype != 'sitemap' and 'prefix' in feed:
+            warnings.append(f"{where}: `prefix` は sitemap 型でしか使われない")
+        if 'topic' in feed and not isinstance(feed['topic'], str):
+            errors.append(f"{where}: `topic` は文字列 1 つ（1 フィード = 1 トピック。複数指定は未対応）")
+        if feed.get('source_mode', 'url') not in SOURCE_MODES:
+            errors.append(f"{where}: `source_mode` は {sorted(SOURCE_MODES)} のいずれか")
+        mode = feed.get('mode', 'backlog')
+        if mode not in FEED_MODES:
+            errors.append(f"{where}: `mode` は {sorted(FEED_MODES)} のいずれか（実際: {mode!r}）")
+        elif mode == 'latest' and ftype == 'sitemap':
+            warnings.append(f"{where}: `mode: latest` は sitemap 型では無視される（seen-set は毎回全件を見る）")
+        if 'categories' in feed:
+            cats = feed['categories']
+            if not isinstance(cats, list) or not cats or not all(isinstance(c, str) and c.strip() for c in cats):
+                errors.append(f"{where}: `categories` は RSS のカテゴリ名（文字列）のリスト")
+            elif ftype == 'sitemap':
+                warnings.append(f"{where}: `categories` は sitemap 型では無視される（sitemap にカテゴリは無い）")
+        if isinstance(feed.get('url'), str):
+            key = f"sitemap:{feed['url']}:{feed.get('prefix')}" if ftype == 'sitemap' else feed['url']
+            if key in seen_keys:
+                errors.append(
+                    f"{where}: `url` が {seen_keys[key]} と重複（同じフィードを 2 回購読すると既読状態を奪い合う）"
+                )
+            seen_keys.setdefault(key, where)
+        topic = feed.get('topic', default_topic)
+        if isinstance(topic, str):
+            feed_topics.add(topic)
+
+    weekly = config.get('weekly_check')
+    if weekly is not None:
+        if not isinstance(weekly, dict):
+            errors.append('`weekly_check:` はマッピング（recall / recall_query）である必要がある')
+        else:
+            unknown(weekly.keys(), WEEKLY_CHECK_KEYS, 'weekly_check')
+            if 'recall' in weekly and not isinstance(weekly['recall'], bool):
+                errors.append('weekly_check.recall: true / false')
+            query = weekly.get('recall_query')
+            if 'recall_query' in weekly and not (isinstance(query, str) and query.strip()):
+                errors.append('weekly_check.recall_query: 空でない文字列')
+
+    topics = config.get('topics')
+    if topics is None:
+        topics = {}
+    if not isinstance(topics, dict):
+        errors.append('`topics:` はトピック名をキーにしたマッピングである必要がある')
+        topics = {}
+    for name, topic_cfg in topics.items():
+        where = f"topics.{name}"
+        if topic_cfg is None:
+            continue
+        if not isinstance(topic_cfg, dict):
+            errors.append(f"{where}: マッピング（audio: ...）である必要がある")
+            continue
+        unknown(topic_cfg.keys(), TOPIC_KEYS, where)
+        _validate_audio(topic_cfg.get('audio'), f"{where}.audio", errors)
+        if name not in feed_topics:
+            warnings.append(f"{where}: このトピックを使うフィードが無い（feeds[].topic と綴りを確認）")
+
+    for i, watch_cfg in enumerate(config.get('watch') or [], 1):
+        where = f"watch[{i}]"
+        if not isinstance(watch_cfg, dict):
+            errors.append(f"{where}: マッピングである必要がある")
+            continue
+        unknown(watch_cfg.keys(), WATCH_KEYS, where)
+        for required in ('name', 'url', 'prefix'):
+            if not isinstance(watch_cfg.get(required), str) or not watch_cfg[required]:
+                errors.append(f"{where}: `{required}` が必要")
+        keywords = watch_cfg.get('keywords', [])
+        if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
+            errors.append(f"{where}: `keywords` は文字列のリスト")
+
+    unknown(settings.keys(), SETTINGS_KEYS, 'settings')
+    title_format = settings.get('notebook_title_format', 'Tech Radio {date}')
+    if not isinstance(title_format, str) or '{date}' not in title_format:
+        errors.append('settings.notebook_title_format には {date} が必要（日ごとのノートブックと自動削除の判定に使う）')
+    else:
+        for placeholder in re.findall(r'\{([^{}]*)\}', title_format):
+            if placeholder not in ('date', 'topic'):
+                errors.append(
+                    f"settings.notebook_title_format: 使えるのは {{date}} と {{topic}} だけ（{{{placeholder}}} は不明）"
+                )
+        if '{topic}' not in title_format and len(feed_topics) > 1:
+            warnings.append(
+                'settings.notebook_title_format に {topic} が無いので、全トピックが同じノートブックに入り、'
+                'トピックの数だけ音声が生成される'
+            )
+    if 'timezone' in settings:
+        try:
+            ZoneInfo(settings['timezone'])
+        except Exception:
+            errors.append(f"settings.timezone: 不明なタイムゾーン {settings['timezone']!r}（例: Asia/Tokyo）")
+    if 'language' in settings and not isinstance(settings['language'], str):
+        errors.append('settings.language: 文字列である必要がある（例: ja）')
+    limits = settings.get('limits') or {}
+    if not isinstance(limits, dict):
+        errors.append('settings.limits: マッピング（per_feed / total）である必要がある')
+    else:
+        unknown(limits.keys(), LIMITS_KEYS, 'settings.limits')
+        for key in LIMITS_KEYS & set(limits):
+            if not _positive_int(limits[key]):
+                errors.append(f"settings.limits.{key}: 1 以上の整数")
+    _validate_audio(settings.get('audio'), 'settings.audio', errors)
+    cleanup = settings.get('cleanup') or {}
+    if not isinstance(cleanup, dict):
+        errors.append('settings.cleanup: マッピングである必要がある')
+    else:
+        unknown(cleanup.keys(), CLEANUP_KEYS, 'settings.cleanup')
+        if 'retention_days' in cleanup and not _positive_int(cleanup['retention_days']):
+            errors.append('settings.cleanup.retention_days: 1 以上の整数')
+        for key in ('enabled', 'dry_run'):
+            if key in cleanup and not isinstance(cleanup[key], bool):
+                errors.append(f"settings.cleanup.{key}: true / false")
+        legacy = cleanup.get('legacy_title_formats') or []
+        if not isinstance(legacy, list) or not all(isinstance(t, str) and '{date}' in t for t in legacy):
+            errors.append('settings.cleanup.legacy_title_formats: {date} を含む文字列のリスト')
+    if 'stale_feed_days' in settings and not _positive_int(settings['stale_feed_days']):
+        errors.append('settings.stale_feed_days: 1 以上の整数')
+    if 'max_age_hours' in settings and not _positive_int(settings['max_age_hours']):
+        errors.append('settings.max_age_hours: 1 以上の整数（時間）')
+
+    if errors:
+        raise ConfigError('config.yaml に問題がある:\n' + '\n'.join(f"・{e}" for e in errors))
+    return warnings
+
+
+def load_state():
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load state.json ({e}). Starting with empty state.")
+            return {}
+    return {}
+
+
+def save_state(state):
+    with open(STATE_PATH, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def redact(text):
+    """Secret がエラー通知経由で外部に漏れるのを防ぐ。"""
+    text = str(text)
+    for name in ('NOTEBOOKLM_AUTH_JSON', 'NOTIFY_WEBHOOK_URL', 'GITHUB_TOKEN'):
+        value = os.environ.get(name)
+        if value and len(value) > 8:
+            text = text.replace(value, f'<{name} redacted>')
+
+    # NOTEBOOKLM_AUTH_JSON は JSON なので、個々のクッキー値が単体で現れることがある
+    raw_auth = os.environ.get('NOTEBOOKLM_AUTH_JSON')
+    if raw_auth:
+        try:
+            for token in _iter_strings(json.loads(raw_auth)):
+                if len(token) > 16:
+                    text = text.replace(token, '<redacted>')
+        except Exception:
+            pass
+
+    return text[:1500]
+
+
+def _iter_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_strings(v)
+
+
+def run_notebooklm_json(args, retries=1):
+    """notebooklm CLI を叩いて JSON を返す。retries>1 は冪等な操作にのみ使うこと。"""
+    cmd = ['notebooklm'] + args + ['--json']
+    # notebooklm login 等で取得した credentials (NOTEBOOKLM_AUTH_JSON) は環境変数として引き継がれます
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=NOTEBOOKLM_TIMEOUT)
+            return json.loads(result.stdout)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+            last_error = e
+            if attempt < retries:
+                wait = 2**attempt
+                print(f"Attempt {attempt}/{retries} failed ({type(e).__name__}). Retrying in {wait}s...")
+                time.sleep(wait)
+    raise last_error
+
+
+AUTH_EXPIRED_HINT = (
+    '認証切れ。手元のクローンで `python3 scripts/setup.py renew` を実行すれば直る'
+    '（CLI の版合わせ → ログイン → 確認 → シークレット更新 → 実行の見届けまでやる）。'
+    '手作業なら、CI 専用プロファイルで `notebooklm -p ci login --fresh` をやり直し、'
+    '`gh secret set NOTEBOOKLM_AUTH_JSON < ~/.notebooklm/profiles/ci/storage_state.json` '
+    'でシークレットを更新すること。環境変数モードは書き戻し先が無く自動更新されないため、放置しても直らない。'
+    ' default プロファイル（普段使い）を押し戻さないこと。ローカル利用のたびに Cookie が'
+    'ローテーションされ、CI にコピーした固定値の寿命が縮む。'
+    '更新しても同じエラーが続くなら、認証ではなく NotebookLM 側の変更。requirements-notebooklm.txt の'
+    '版を上げる（Dependabot の PR か、notebooklm-py のリリースを確認）。'
+)
+
+# 失効したセッションでの CLI の message。出方は 2 通り見つかっている:
+# - Google のログイン画面へ飛ばされる（2026-08）
+# - notebook.google.com のページは返るが CSRF トークンが無い（2026-10-02〜05）。message は
+#   "page structure has changed" と言うが、同じ CLI でも新しくログインしたプロファイルなら通ったので実態は失効
+AUTH_EXPIRED_MARKERS = ('Authentication expired or invalid', 'CSRF token not found')
+
+
+AUDIO_FAILED_NOTE = (
+    '記事はノートブックに入ったが、音声の生成を開始できなかった。記事は既読にしてある'
+    '（再実行しても同じ URL を二重投入するだけなので）。NotebookLM アプリから手動で生成できる。'
+    'code が rate_limited なら 1 日の生成上限（無料 3 本 / Plus 6 本 / Pro 20 本）に当たっている。'
+)
+
+NOTEBOOK_URL_BASE = 'https://notebooklm.google.com/notebook/'
+
+
+def _cli_error_envelope(stdout):
+    """notebooklm CLI の JSON エラー封筒から code と message だけを取り出す。
+
+    封筒以外（プレーンテキスト、JSON でない、error フラグが無い）は None を返す。
+    """
+    if not stdout:
+        return None
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload.get('error'):
+        return None
+    parts = [str(payload[key]) for key in ('code', 'message') if payload.get(key)]
+    return ': '.join(parts) or None
+
+
+def describe_failure(e):
+    """例外を、通知に載せられる説明文へ整形する。
+
+    notebooklm CLI は `--json` 付きで失敗すると stdout に
+    {"error": true, "code": ..., "message": ...} を出す。exit code だけを載せると
+    認証切れもライブラリのバグも同じ 2 に潰れて区別がつかない（2026-08-05 の
+    セッション失効に 2 週間気付けなかったのはこれが理由）。そこで封筒が読めた場合だけ
+    code と message を添える。
+
+    stdout/stderr の生の中身はセッションクッキーを運びうるので決して載せない。
+    封筒の既知フィールドだけを拾うことで、redact() の後段防御に頼らずに済ませる。
+    """
+    if not isinstance(e, subprocess.CalledProcessError):
+        return f"{type(e).__name__}: {e}"
+
+    msg = f"NotebookLM command failed.\nCommand: {' '.join(e.cmd)}\nExit code: {e.returncode}"
+    detail = _cli_error_envelope(e.stdout)
+    if detail:
+        msg += f"\n{detail}"
+        if any(marker in detail for marker in AUTH_EXPIRED_MARKERS):
+            msg += f"\n\n{AUTH_EXPIRED_HINT}"
+    return msg
+
+
+def get_or_create_notebook(title):
+    print(f"Listing notebooks to find '{title}'...")
+    notebooks_data = run_notebooklm_json(['list'], retries=3)
+    for nb in notebooks_data.get('notebooks', []):
+        if nb.get('title') == title:
+            print(f"Found existing notebook: '{title}' (ID: {nb['id']})")
+            return nb['id']
+
+    print(f"Notebook '{title}' not found. Creating new one...")
+    res = run_notebooklm_json(['create', title])
+    return res['notebook']['id']
+
+
+def strip_html(text):
+    """RSSの配信文からタグを落としてプレーンテキストにする。"""
+    text = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', text, flags=re.S | re.I)
+    text = re.sub(r'<br\s*/?>|</p\s*>|</div\s*>|</li\s*>', '\n', text, flags=re.I)
+    text = re.sub(r'<[^>]+>', '', text)
+    return re.sub(r'\n{3,}', '\n\n', html.unescape(text)).strip()
+
+
+def entry_summary(entry):
+    """エントリの本文（配信されている範囲）をプレーンテキストで返す。
+
+    content:encoded を配信しているフィードは全文が入ることもあるが、
+    OpenAI のように description だけ（=要約のみ）のフィードもある。
+    """
+    contents = getattr(entry, 'content', None)
+    raw = (contents[0].get('value') if contents else '') or getattr(entry, 'summary', '') or ''
+    return strip_html(raw)
+
+
+def entry_categories(entry):
+    """RSS の <category> / Atom の <category term> を小文字の集合で返す。"""
+    return {(tag.get('term') or '').strip().lower() for tag in getattr(entry, 'tags', None) or []} - {''}
+
+
+def entry_has_content(entry, link):
+    """フィードの配信テキストが記事の本文そのものか（要約ではないか）。
+
+    - content:encoded / Atom <content> がある → 本文を配信している
+    - リンクが #アンカー → 1 ページに全項目が並ぶ変更履歴で、項目のテキストがその項目の全部
+      （Claude Platform のリリースノートは description に 1 日分の全文を入れている）
+    記事ページが別にあって description / <summary> だけのフィード（OpenAI、中央値 149 字）は
+    要約なので False。長さでは決めない: OpenAI の要約は最長 683 字、リリースノートの全文は
+    短い日で 100 字足らずと重なっている。
+    テキスト投入時の但し書き（「本文」か「要約のみ」か）をこれで切り替える。
+    """
+    contents = getattr(entry, 'content', None)
+    if contents and strip_html(contents[0].get('value') or ''):
+        return True
+    return bool(urldefrag(link).fragment)
+
+
+def build_text_source(article):
+    """記事URLの代わりに投入するテキストソースをMarkdownで組み立てる。
+
+    NotebookLM のフェッチャーを通らないのでボット判定に引っかからず、#アンカーのリンクで
+    ページ全体を取り込むこともない。ただし中身はRSSが配信している範囲であって、記事の全文とは
+    限らない。ラジオが「全文を読んだ」前提で語ると誤情報になるので、何が入っているか
+    （本文か、要約だけか、タイトルだけか）を本文の先頭に必ず書く。
+    """
+    summary = article.get('summary') or ''
+    ts = article.get('ts')
+    published = ts.astimezone(LOCAL_TZ).strftime('%Y-%m-%d') if ts else '不明'
+    reason = '記事ページをURLのまま取り込むと中身が正しく入らない配信元のため、'
+
+    if summary and article.get('has_content'):
+        # 変更履歴のRSS（1項目の全文が content:encoded に入っている）など
+        note = (
+            f'{reason}公式フィードが配信している本文をそのまま収録しています。'
+            'フィードの本文が記事ページの全文と同じとは限りません。'
+        )
+        body = f"## 配信されている本文（フィード原文のまま）\n\n{summary}"
+    elif summary:
+        note = f'{reason}公式RSSが配信している要約文のみを収録しています。**記事の全文ではありません。**'
+        body = f"## 配信されている要約（RSS原文のまま）\n\n{summary}"
+    else:
+        note = f'{reason}RSSにも要約文がなく、**タイトルと公開日しか判明していません。**'
+        body = '## 本文\n\n（RSSに要約文が含まれていないため、タイトル以外の情報はありません）'
+
+    return (
+        f"# {article['title']}\n\n"
+        f"> ⚠️ {note}\n"
+        f"> ここに書かれていない内容を推測で補わず、詳細は「未確認」として扱ってください。\n\n"
+        f"- 出典: {article['feed_name']}\n"
+        f"- URL: {article['link']}\n"
+        f"- 公開日: {published}\n\n"
+        f"{body}\n"
+    )
+
+
+def source_add_args(article, notebook_id):
+    """`notebooklm source add` の引数を組み立てる。"""
+    if article.get('source_mode') != TEXT_SOURCE_MODE:
+        return ['source', 'add', article['link'], '--notebook', notebook_id]
+    # --title=... の形にするのは、記事タイトルが '-' で始まってもオプション扱いされないため。
+    # フィード名を添えるのは、変更履歴の "2.1.283" のようなタイトルだけでは何の話か分からないから
+    # （URL投入のソースも "記事名 | サイト名" の形になるので揃う）
+    return [
+        'source',
+        'add',
+        build_text_source(article),
+        '--type',
+        'text',
+        f"--title={article['title']} | {article['feed_name']}",
+        '--notebook',
+        notebook_id,
+    ]
+
+
+def add_sources_and_wait(notebook_id, articles):
+    """ソースを追加して読み込みを待つ。(使えるソース ID の一覧, 取り込めなかった [(url, title)]) を返す。
+
+    一覧が空なら音声を生成しない。ID を返すのは `generate audio -s` で「この回に入れた記事だけ」から
+    音声を作るため（夕方の回が朝の記事を再放送しない）。
+
+    1件の失敗でバッチ全体を止めない。1件も追加できなかった場合のみ例外を投げる。
+    add が成功しても、サイトのボット対策ページを掴まされていることがある
+    (タイトルが "Just a moment..." 等)。中身がないので削除し、呼び出し元に報告する。
+    """
+    source_ids = {}  # url -> source_id
+    fetched_ids = {}  # うち NotebookLM にURLを取得させたもの。ボット対策ページ判定の対象
+    failed_urls = []
+    for article in articles:
+        url = article['link']
+        is_text = article.get('source_mode') == TEXT_SOURCE_MODE
+        try:
+            print(f"Adding {'text ' if is_text else ''}source: {url}")
+            res = run_notebooklm_json(source_add_args(article, notebook_id))
+            source_ids[url] = res['source']['id']
+            if not is_text:
+                fetched_ids[url] = res['source']['id']
+        except Exception as e:
+            print(f"Warning: Failed to add source {url}: {redact(e)}")
+            failed_urls.append(url)
+
+    if not source_ids:
+        raise RuntimeError(f"All sources failed to add: {failed_urls}")
+
+    if failed_urls:
+        print(f"Note: {len(failed_urls)} source(s) failed, continuing with {len(source_ids)} source(s).")
+
+    # 読み込み待ちも個別に失敗を許容する（add と同じ方針）
+    ready_ids = []
+    for sid in source_ids.values():
+        print(f"Waiting for source to be ready: {sid}")
+        try:
+            subprocess.run(
+                ['notebooklm', 'source', 'wait', sid, '--notebook', notebook_id],
+                check=True,
+                timeout=SOURCE_WAIT_TIMEOUT,
+            )
+            ready_ids.append(sid)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"Warning: Source {sid} did not become ready: {type(e).__name__}")
+
+    if not ready_ids:
+        raise RuntimeError('No source became ready; skipping audio generation.')
+
+    # 判定はURL投入分だけ。テキスト投入分はフェッチャーを通っていないので構造上
+    # ボット対策ページになり得ず、こちらが付けたタイトルを誤検知するだけになる。
+    blocked = remove_junk_sources(notebook_id, fetched_ids)
+    junk_ids = {fetched_ids[url] for url, _title in blocked if url in fetched_ids}
+    usable_ids = [sid for sid in ready_ids if sid not in junk_ids]
+    print(f"{len(ready_ids)}/{len(source_ids)} source(s) ready, {len(blocked)} junk removed, {len(usable_ids)} usable.")
+    # 全部ボット対策ページだった場合は空を返し、音声を生成しない（古いソースだけで空回りさせない）
+    return usable_ids, blocked
+
+
+def remove_junk_sources(notebook_id, source_ids):
+    """ボット対策ページを掴んだソースを検出して削除し、[(url, title)] を返す。
+
+    検出に失敗しても本体は止めない。見逃しはラジオの質の問題であって配信は壊れないので、
+    警告ログにとどめて続行する。
+    """
+    if not source_ids:
+        return []
+    try:
+        listing = run_notebooklm_json(['source', 'list', '--notebook', notebook_id], retries=2)
+    except Exception as e:
+        print(f"Warning: source list failed; skipping junk detection: {redact(e)}")
+        return []
+
+    titles = {s.get('id'): s.get('title') or '' for s in listing.get('sources', [])}
+    blocked = []
+    for url, sid in source_ids.items():
+        title = titles.get(sid, '')
+        if not JUNK_TITLE_RE.search(title):
+            continue
+        print(f"Junk source detected for {url} (title: '{title}'); removing it.")
+        try:
+            # -y は必須。source delete は確認プロンプトを出すので、TTY のない CI では
+            # EOF で Abort になり削除が成立しない（junk を含んだまま音声が生成される）
+            run_notebooklm_json(['source', 'delete', sid, '-y', '--notebook', notebook_id])
+        except Exception as e:
+            print(f"Warning: failed to remove junk source {sid}: {redact(e)}")
+        blocked.append((url, title))
+    return blocked
+
+
+def audio_settings_for(config, topic):
+    """音声設定を topics.<topic>.audio → settings.audio → 既定 の順で解決する。
+
+    language だけは settings.language が全体の既定（topics.<topic>.audio.language で上書き可）。
+    トピックごとに format（deep-dive / brief / critique / debate）やプロンプトを変えるための入口。
+    """
+    settings = config.get('settings') or {}
+    merged = {'language': settings.get('language', 'ja')}
+    merged.update(settings.get('audio') or {})
+    topic_cfg = (config.get('topics') or {}).get(topic) or {}
+    merged.update(topic_cfg.get('audio') or {})
+    return merged
+
+
+def generate_audio(notebook_id, language='ja', prompt=None, length=None, fmt=None, source_ids=None):
+    print(f"Triggering audio generation (language: {language}, format: {fmt or 'default'})...")
+    # --no-wait のため、これは「生成の開始」であって「完了」ではない。
+    # --json 付き(run_notebooklm_json)で呼ぶのは、失敗時に CLI の封筒(code/message)を通知に
+    # 載せるため。日次の生成上限に当たると rate_limited で失敗するが、exit code だけでは分からない。
+    args = ['generate', 'audio', '--no-wait', '--notebook', notebook_id, '--language', language]
+    if fmt:
+        args += ['--format', fmt]
+    if length:
+        args += ['--length', length]
+    # -s を渡すとその回に入れた記事だけから音声を作る。渡さなければノートブック全体（scope: notebook）
+    for sid in source_ids or ():
+        args += ['-s', sid]
+    if prompt:
+        args.append(prompt)
+    result = run_notebooklm_json(args)
+    # 標準出力を捕捉したので、ログには要点だけ残す
+    print(f"Audio generation {result.get('status', 'triggered')} (task: {result.get('task_id')})")
+    return result
+
+
+def _post_webhook(webhook_url, payload, label):
+    try:
+        response = httpx.post(webhook_url, json=payload, timeout=15.0)
+        response.raise_for_status()
+        print(f"{label} sent successfully.")
+    except Exception as e:
+        print(f"Failed to send {label.lower()}: {redact(e)}")
+
+
+def send_notification(webhook_url, new_articles, blocked=None, notebooks=None, no_audio=None):
+    """新着一覧を通知する。
+
+    notebooks: {topic: (title, notebook_id)}。見出しにノートブック名とリンクを載せる
+    （無いと、アプリで命名規則からノートブックを探すことになる）。
+    no_audio: 音声の生成を開始できなかった/しなかったトピックの集合。「開始した」と嘘をつかない。
+    """
+    if not webhook_url:
+        print("No notification Webhook URL configured. (NOTIFY_WEBHOOK_URL is empty)")
+        return
+
+    is_discord = "discord.com" in webhook_url
+    notebooks = notebooks or {}
+    no_audio = no_audio or set()
+
+    # 参照元URLも載せる（後から出典を辿れるように）
+    def fmt(art):
+        # テキスト投入のうち要約しか入っていない分は、ラジオの情報量が違うので明示する
+        # （本文を配信しているフィードは印を付けない）
+        summary_only = art.get('source_mode') == TEXT_SOURCE_MODE and not art.get('has_content')
+        note = '・要約のみ' if summary_only else ''
+        if is_discord:
+            return f"・{art['title']}（{art['feed_name']}{note}）\n  {art['link']}"
+        return f"・<{art['link']}|{art['title']}>（{art['feed_name']}{note}）"
+
+    # トピック(=ノートブック)ごとに見出しを付ける。topic なしの記事は見出しなしでそのまま並べる
+    by_topic = {}
+    for art in new_articles:
+        by_topic.setdefault(art.get('topic'), []).append(art)
+    sections = []
+    for topic, arts in by_topic.items():
+        lines = "\n".join(fmt(a) for a in arts)
+        header = f"《{topic}》" if topic else ''
+        if topic in notebooks:
+            title, notebook_id = notebooks[topic]
+            url = f"{NOTEBOOK_URL_BASE}{notebook_id}"
+            header += f" {title}\n  {url}" if is_discord else f" <{url}|{title}>"
+        if topic in no_audio:
+            header += "（音声は未生成）"
+        sections.append(f"{header}\n{lines}" if header else lines)
+
+    parts = []
+    if new_articles:
+        # どのフィード（企業）から新着があったかを集計
+        feed_names = list(dict.fromkeys([art['feed_name'] for art in new_articles]))  # 順序を保ったユニーク化
+        sources = "、".join(feed_names)
+        started = [t for t in by_topic if t not in no_audio]
+        status = (
+            "ラジオの生成を開始したよ〜"
+            if started
+            else "ラジオの生成は開始できなかったよ（理由は下の注記か別の通知を見てね）"
+        )
+        parts.append(f"🎙️ {sources} が新しい記事出してたよ（{len(new_articles)}件）\n{status}")
+        parts.extend(sections)
+    if blocked:
+        blocked_lines = "\n".join(f"・{url}" for url, _title in blocked)
+        parts.append(f"⚠️ 以下はサイトのボット対策で本文を取り込めなかったから、ラジオには入ってないよ\n{blocked_lines}")
+    if not parts:
+        return
+
+    text = "\n".join(parts)
+    payload = {"content": text} if is_discord else {"text": text}
+    _post_webhook(webhook_url, payload, 'Notification')
+
+
+def send_no_news_notification(webhook_url):
+    """新着ゼロでも一報入れる。沈黙が「新着なし」なのか「故障」なのか区別できるように。"""
+    if not webhook_url:
+        return
+    is_discord = "discord.com" in webhook_url
+    text = "😪 今回は新着なしだったよ。ラジオはおやすみ〜"
+    _post_webhook(webhook_url, {"content": text} if is_discord else {"text": text}, 'No-news notification')
+
+
+def send_maintenance_warning(webhook_url, text):
+    """メンテナンス（cleanup 等）の失敗。フィード取得の問題とは別の見出しで出す。"""
+    if not webhook_url:
+        return
+    is_discord = "discord.com" in webhook_url
+    _post_webhook(webhook_url, {"content": text} if is_discord else {"text": text}, 'Maintenance warning')
+
+
+def send_feed_warning(webhook_url, warnings):
+    if not webhook_url or not warnings:
+        return
+
+    is_discord = "discord.com" in webhook_url
+    lines = "\n".join(f"・{name}: {reason}" for name, reason in warnings)
+    text = f"⚠️ フィードに問題があるよ\n{lines}"
+    payload = {"content": text} if is_discord else {"text": text}
+    _post_webhook(webhook_url, payload, 'Feed warning')
+
+
+def send_stale_notification(webhook_url, articles):
+    """鮮度の足切り（settings.max_age_hours）で流さなかった記事を知らせる。
+
+    黙って消さない。読みたければ辿れるように題名とリンクを出す（障害明けは多いので先頭だけ）。
+    """
+    if not webhook_url or not articles:
+        return
+    unique = list({a['link']: a for a in sorted(articles, key=lambda a: a['ts'] or EPOCH, reverse=True)}.values())
+    shown = unique[:STALE_LIST_MAX]
+    is_discord = 'discord.com' in webhook_url
+    if is_discord:
+        lines = '\n'.join(f"・{a['title']}（{a['feed_name']}）\n  {a['link']}" for a in shown)
+    else:
+        lines = '\n'.join(f"・<{a['link']}|{a['title']}>（{a['feed_name']}）" for a in shown)
+    more = f"\n…ほか {len(unique) - len(shown)} 件" if len(unique) > len(shown) else ''
+    text = (
+        f"⏭ 公開から {MAX_AGE_HOURS} 時間以上たっていたので、ラジオには入れずに既読にしたよ（{len(unique)}件）\n"
+        f"{lines}{more}"
+    )
+    _post_webhook(webhook_url, {'content': text} if is_discord else {'text': text}, 'Stale notification')
+
+
+def send_error_notification(webhook_url, error_message, notebook_title=None):
+    if not webhook_url:
+        print("No notification Webhook URL configured. (NOTIFY_WEBHOOK_URL is empty)")
+        return
+
+    is_discord = "discord.com" in webhook_url
+    error_message = redact(error_message)
+
+    # GitHub Actionsの実行URLを組み立てる（環境変数から取得）
+    github_run_url = ""
+    server_url = os.environ.get('GITHUB_SERVER_URL')
+    repository = os.environ.get('GITHUB_REPOSITORY')
+    run_id = os.environ.get('GITHUB_RUN_ID')
+    if server_url and repository and run_id:
+        github_run_url = f"\n*実行ログ:* <{server_url}/{repository}/actions/runs/{run_id}|GitHub Actions Run>"
+
+    if is_discord:
+        notebook_info = f"ノートブック「{notebook_title}」" if notebook_title else "バッチ処理"
+        discord_run_url = f"\n**実行ログ:** <{server_url}/{repository}/actions/runs/{run_id}>" if github_run_url else ""
+        text = (
+            f"⚠️ **Tech Radio 実行エラー発生**\n"
+            f"{notebook_info}の処理中にエラーが発生しました。\n\n"
+            f"**エラー内容:**\n```{error_message}```"
+            f"{discord_run_url}"
+        )
+        payload = {"content": text}
+    else:
+        # Slack Block Kit フォーマット
+        notebook_info = f"ノートブック「*{notebook_title}*」" if notebook_title else "バッチ処理"
+        payload = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "⚠️ Tech Radio 実行エラー発生", "emoji": True},
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"{notebook_info} の処理中にエラーが発生しました。"},
+                },
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*エラー内容:*\n```{error_message}```"}},
+            ]
+        }
+        if github_run_url:
+            payload["blocks"].append({"type": "context", "elements": [{"type": "mrkdwn", "text": github_run_url}]})
+
+    _post_webhook(webhook_url, payload, 'Error notification')
+
+
+# ---------------------------------------------------------------------------
+# メンテナンス: 古いラジオの削除 / 停滞フィードの検知
+#
+# 削除は「このバッチが作ったノートブックだけ」が対象。タイトルが
+# notebook_title_format の日付形式に完全一致しない限り候補にすら入らないので、
+# 手動で作ったノートブックには構造的に触れない。
+# ---------------------------------------------------------------------------
+
+
+def _notebook_title_patterns(config):
+    """削除対象を判定する正規表現の一覧。完全一致のみ（手動ノートを守る唯一の砦）。
+
+    {topic} は config に実在するトピック名だけの選択肢に展開する。任意文字にマッチ
+    させると「バッチ命名かどうか」の保証が消えるので、絶対に緩めないこと。
+    """
+    settings = config.get('settings', {})
+    templates = [settings.get('notebook_title_format', 'Tech Radio {date}')]
+    templates += (settings.get('cleanup') or {}).get('legacy_title_formats') or []
+    # feeds[].topic に加えて topics: セクションの名前も候補にする（フィードを外した後も掃除できるように）
+    topics = {f.get('topic', DEFAULT_TOPIC) for f in config.get('feeds', [])} | {DEFAULT_TOPIC}
+    topics |= set((config.get('topics') or {}).keys())
+    # 週 1 回の取りこぼし検査が作るノートブック（Tech Radio Recall {date}）も、古くなれば同じ規則で消す
+    if (config.get('weekly_check') or {}).get('recall'):
+        topics.add(RECALL_TOPIC)
+    topic_re = '(?:' + '|'.join(re.escape(t) for t in sorted(topics)) + ')'
+
+    patterns = []
+    for template in templates:
+        escaped = re.escape(template)
+        escaped = escaped.replace(re.escape('{date}'), r'(\d{4}-\d{2}-\d{2})')
+        escaped = escaped.replace(re.escape('{topic}'), topic_re)
+        patterns.append(re.compile(escaped))
+    return patterns
+
+
+def cleanup_old_notebooks(config, webhook_url, now=None):
+    settings = config.get('settings', {})
+    cleanup_cfg = settings.get('cleanup') or {}
+    if not cleanup_cfg.get('enabled', False):
+        return
+
+    retention_days = int(cleanup_cfg.get('retention_days', 7))
+    dry_run = bool(cleanup_cfg.get('dry_run', True))
+    # "Tech Radio {topic} {date}" → ^Tech\ Radio\ (?:AI|Infra)\ (\d{4}-\d{2}-\d{2})$ 等、完全一致で判定
+    patterns = _notebook_title_patterns(config)
+
+    now = now or datetime.datetime.now(LOCAL_TZ)
+    cutoff = (now.astimezone(LOCAL_TZ) - datetime.timedelta(days=retention_days)).date()
+
+    notebooks = run_notebooklm_json(['list'], retries=3).get('notebooks', [])
+    targets = []
+    for nb in notebooks:
+        title = nb.get('title') or ''
+        m = None
+        for pattern in patterns:
+            m = pattern.fullmatch(title)
+            if m:
+                break
+        if not m:
+            continue  # バッチ命名でないものは絶対に触らない
+        try:
+            nb_date = datetime.date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if nb_date < cutoff:
+            targets.append(nb)
+
+    if not targets:
+        print(f"Cleanup: no notebooks older than {retention_days} days.")
+        return
+
+    deleted, failed = [], []
+    for nb in targets:
+        if dry_run:
+            print(f"Cleanup (dry-run): would delete '{nb['title']}' (ID: {nb['id']})")
+            deleted.append(nb['title'])
+            continue
+        try:
+            run_notebooklm_json(['delete', '-n', nb['id'], '-y'])
+            print(f"Cleanup: deleted '{nb['title']}' (ID: {nb['id']})")
+            deleted.append(nb['title'])
+        except Exception as e:
+            print(f"Cleanup: failed to delete '{nb['title']}': {redact(e)}")
+            failed.append(nb['title'])
+
+    if webhook_url:
+        lines = '\n'.join(f"・{t}" for t in deleted)
+        if dry_run:
+            text = f"🧹 [ドライラン] {retention_days}日より古いラジオ {len(deleted)}件が削除対象だよ（まだ消してない）\n{lines}"
+        else:
+            text = f"🧹 {retention_days}日より古いラジオ {len(deleted)}件を削除したよ\n{lines}"
+        if failed:
+            text += '\n⚠️ 削除に失敗:\n' + '\n'.join(f"・{t}" for t in failed)
+        is_discord = 'discord.com' in webhook_url
+        _post_webhook(webhook_url, {'content': text} if is_discord else {'text': text}, 'Cleanup notification')
+
+
+def check_stale_feeds(config, state, webhook_url, now=None):
+    """毎月1日(settings.timezone 基準)に、30日以上新着のないフィードを知らせる。"""
+    now = now or datetime.datetime.now(LOCAL_TZ)
+    if now.astimezone(LOCAL_TZ).day != 1:
+        return
+
+    stale_days = int(config.get('settings', {}).get('stale_feed_days', 30))
+    stale = []
+    for feed_cfg in config.get('feeds', []):
+        raw = state.get(feed_state_key(feed_cfg))
+        last_new = raw.get('last_new') if isinstance(raw, dict) else None
+        if not last_new:
+            continue
+        age = (now.astimezone(UTC) - datetime.datetime.fromisoformat(last_new)).days
+        if age >= stale_days:
+            stale.append((feed_cfg.get('name'), age))
+
+    if not stale or not webhook_url:
+        return
+    lines = '\n'.join(f"・{name}: {age}日間新着なし" for name, age in stale)
+    text = f"🩺 月次ヘルスチェック: 長期間新着のないフィードがあるよ（配信停止やサイト構造の変化かも）\n{lines}"
+    is_discord = 'discord.com' in webhook_url
+    _post_webhook(webhook_url, {'content': text} if is_discord else {'text': text}, 'Stale feed notification')
+
+
+def run_maintenance(config, state, webhook_url):
+    """本体処理の成否に影響させないメンテナンス。失敗しても警告通知のみ。"""
+    try:
+        cleanup_old_notebooks(config, webhook_url)
+    except Exception as e:
+        print(f"Warning: cleanup failed: {redact(e)}", file=sys.stderr)
+        send_maintenance_warning(webhook_url, f'🧹 古いラジオの削除に失敗したよ（{type(e).__name__}）。次回また試すよ')
+    try:
+        check_stale_feeds(config, state, webhook_url)
+    except Exception as e:
+        print(f"Warning: stale feed check failed: {redact(e)}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# ページ更新の監視 (watch)
+#
+# サポートページなど「聴くコンテンツではないが即時に知りたい」更新を Slack に
+# 通知するだけの経路。ラジオ（NotebookLM/音声）には一切流さない。
+#
+# 既読判定は watermark ではなく URL→lastmod の辞書で行う。RSS と違い同じ記事の
+# lastmod が何度も動く（=再浮上する）ので、単一時刻の透かしでは表現できない。
+# キーワードで絞った母集合は有界なので、辞書を丸ごと持っても肥大しない。
+# ---------------------------------------------------------------------------
+
+
+def send_watch_notification(webhook_url, name, updates):
+    if not webhook_url:
+        print("No notification Webhook URL configured. (NOTIFY_WEBHOOK_URL is empty)")
+        return
+    is_discord = 'discord.com' in webhook_url
+    if is_discord:
+        lines = '\n'.join(f"・[{kind}] {art['title']}\n  {art['link']}" for art, kind in updates)
+    else:
+        lines = '\n'.join(f"・[{kind}] <{art['link']}|{art['title']}>" for art, kind in updates)
+    text = f"📌 {name} のページが更新されたよ（{len(updates)}件）\n{lines}"
+    _post_webhook(webhook_url, {'content': text} if is_discord else {'text': text}, 'Watch notification')
+
+
+def check_watch_pages(config, state, webhook_url):
+    """config の watch 対象を確認し、更新を通知して state を進める。warnings を返す。"""
+    warnings = []
+    for watch_cfg in config.get('watch', []):
+        name = watch_cfg.get('name')
+        url = watch_cfg.get('url')
+        prefix = watch_cfg.get('prefix')
+        keywords = [k.lower() for k in watch_cfg.get('keywords', [])]
+        print(f"Checking watch target: {name} ({url})")
+
+        feed, problem = fetch_sitemap_feed(url, prefix)
+        if problem:
+            # 取得失敗時は state に触らない（一時的な404で全記事が「新規」に戻る事故を防ぐ）
+            print(f"[watch:{name}] Warning: {problem}")
+            warnings.append((name, problem))
+            continue
+
+        state_key = f'watch:{url}:{prefix}'
+        raw = state.get(state_key)
+        seen = raw.get('lastmod') if isinstance(raw, dict) else None
+        first_run = seen is None
+
+        current = {}
+        updates = []
+        for entry in feed.entries:
+            slug = entry.link.lower()
+            if keywords and not any(k in slug for k in keywords):
+                continue
+            ts = entry_time(entry)
+            lastmod = ts.isoformat() if ts else ''
+            current[entry.link] = lastmod
+            if first_run:
+                continue
+            title = re.sub(r'^\d+\s*', '', entry.title)  # スラッグ先頭の記事ID番号を除く
+            article = {'title': title, 'link': entry.link}
+            if entry.link not in seen:
+                updates.append((article, '新規'))
+            elif seen[entry.link] != lastmod:
+                updates.append((article, '更新'))
+
+        if first_run:
+            print(f"[watch:{name}] First run: recording {len(current)} matched pages without notifying.")
+        elif updates:
+            for art, kind in updates:
+                print(f"[watch:{name}] {kind}: {art['link']}")
+            send_watch_notification(webhook_url, name, updates)
+        else:
+            print(f"[watch:{name}] No changes among {len(current)} matched pages.")
+
+        # sitemap から消えたページは追跡をやめる（current で丸ごと置き換え）
+        state[state_key] = {'lastmod': current}
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# フィードの取得と既読判定
+#
+# 既読判定の土台は「透かし(watermark)」= 処理した最新記事の公開時刻。
+# 「既読IDの一覧」だけで判定すると、リストを有界にした瞬間に溢れた記事が未読へ戻る。
+# 時刻は単調増加するので、フィードが何件返そうと、IDを何件捨てようと壊れない。
+#
+# ただし透かしだけでは 2 種類の記事を取り違える。
+# - 前日付で後から差し込まれた記事: 透かしより古いので、現れた時点で既読扱いになる。
+#   → 透かしから LOOKBACK だけ遡った範囲は「処理済み ID に無ければ未読」とみなす。
+# - 公開時刻が後から動いた記事（編集で日付が付け直される Vercel、毎週日付が進む定期投稿）:
+#   透かしより新しくなり、放送済みなのに新着扱いになる。
+#   → 処理した記事の ID は必ず recent_ids に残し、ID で既読と分かるものは時刻を見ない。
+# 振り返りの下限 floor は、そのフィードをこの方式で見始めた時点の透かし。移行前に処理した
+# 記事は ID を残していないので、floor より前へは遡らない（遡ると 1 週間分を再放送する）。
+# ---------------------------------------------------------------------------
+
+
+def entry_time(entry):
+    """エントリの公開時刻を aware な UTC datetime で返す。取得できなければ None。"""
+    for attr in ('published_parsed', 'updated_parsed'):
+        parsed = getattr(entry, attr, None)
+        if parsed:
+            return datetime.datetime(*parsed[:6], tzinfo=UTC)
+    return None
+
+
+def entry_key(entry):
+    return getattr(entry, 'id', None) or getattr(entry, 'link', None)
+
+
+def fetch_feed(url):
+    """フィードを取得する。(feed, 問題の説明 or None) を返す。"""
+    try:
+        response = httpx.get(url, timeout=FEED_TIMEOUT, follow_redirects=True, headers={'User-Agent': USER_AGENT})
+    except Exception as e:
+        return None, f"取得失敗: {type(e).__name__}"
+
+    if response.status_code >= 400:
+        return None, f"HTTP {response.status_code}"
+
+    feed = feedparser.parse(response.content)
+    if not feed.entries:
+        reason = "エントリが0件"
+        if getattr(feed, 'bozo', False):
+            reason += f" (パース失敗: {type(feed.bozo_exception).__name__})"
+        return None, reason
+
+    return feed, None
+
+
+def fetch_sitemap_feed(url, prefix):
+    """RSSを配信しないサイト向け: sitemap.xml をフィードに見立てる。
+
+    prefix 配下のURLだけを記事として扱い、<lastmod> があれば公開時刻代わりに使う。
+    lastmod は「最終更新日」なので、既存記事の修正で再浮上しうる。
+    lastmod の無い sitemap (claude.com など) では ID のみで新着判定される。
+    """
+    try:
+        response = httpx.get(url, timeout=FEED_TIMEOUT, follow_redirects=True, headers={'User-Agent': USER_AGENT})
+    except Exception as e:
+        return None, f"取得失敗: {type(e).__name__}"
+
+    if response.status_code >= 400:
+        return None, f"HTTP {response.status_code}"
+
+    try:
+        root = ElementTree.fromstring(response.content)
+    except ElementTree.ParseError as e:
+        return None, f"パース失敗: {type(e).__name__}"
+
+    ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+    entries = []
+    for node in root.findall('sm:url', ns):
+        loc = node.findtext('sm:loc', default='', namespaces=ns).strip()
+        if not loc.startswith(prefix) or loc.rstrip('/') == prefix.rstrip('/'):
+            continue
+        entry = SimpleNamespace(
+            id=loc,
+            link=loc,
+            title=loc.rstrip('/').rsplit('/', 1)[-1].replace('-', ' '),
+        )
+        lastmod = node.findtext('sm:lastmod', default='', namespaces=ns).strip()
+        if lastmod:
+            try:
+                parsed = datetime.datetime.fromisoformat(lastmod.replace('Z', '+00:00'))
+                entry.published_parsed = parsed.utctimetuple()
+            except ValueError:
+                pass
+        entries.append(entry)
+
+    if not entries:
+        return None, f"prefix に一致するURLが0件: {prefix}"
+    return SimpleNamespace(entries=entries), None
+
+
+def feed_state_key(feed_cfg):
+    """state のキー。
+
+    sitemap 型は同一URLを prefix 違いで複数フィードが共有しうる（例: anthropic.com の
+    /news/ と /engineering/）。URLだけをキーにすると2フィードが1つの既読状態を奪い合い、
+    片方の記事が黙ってスキップされるので、キーに prefix を含めて分離する。
+    """
+    if feed_cfg.get('type') == 'sitemap':
+        return f"sitemap:{feed_cfg['url']}:{feed_cfg['prefix']}"
+    return feed_cfg['url']
+
+
+def normalize_url(url):
+    """sitemap の既読照合に使う形。末尾の / の有無だけで別の記事にしない。
+
+    antigravity.google は 2026-09 に記事 URL の末尾へ / を付けた。既読集合と 1 件も一致しなくなり、
+    全 24 記事が新着に見えて古い記事が再放送された。
+    """
+    return url.rstrip('/')
+
+
+def read_sitemap_state(state, key, legacy_url, entries):
+    """sitemap 型フィードの既読URL集合を返す。(seen or None, 移行したか)。None は真の初回。
+
+    旧形式（URLキー + watermark）が残っていれば、そこから既読集合を復元する。
+    旧形式で「既読」だった条件 = recent_ids に載っている、または lastmod が透かし以前。
+    """
+    raw = state.get(key)
+    if isinstance(raw, dict) and 'seen' in raw:
+        return {normalize_url(u) for u in raw['seen']}, False
+
+    legacy = state.get(legacy_url)
+    if isinstance(legacy, dict) and legacy.get('watermark'):
+        watermark = datetime.datetime.fromisoformat(legacy['watermark'])
+        recent = set(legacy.get('recent_ids', []))
+        seen = {normalize_url(e['id']) for e in entries if e['id'] in recent or (e['ts'] and e['ts'] <= watermark)}
+        print(f"Migrating legacy watermark state to a seen-set ({len(seen)} read) for {key}.")
+        return seen, True
+
+    return None, False
+
+
+def read_feed_state(state, url):
+    """(watermark, floor, recent_ids) を返す。未初期化・旧形式(IDのリスト)は初回実行として扱う。
+
+    floor の無い state は振り返り導入前のもの。処理済み記事の ID を同時刻分しか残していないので、
+    floor = 現在の透かしとして、それより前へは遡らない（遡ると処理済みの記事を再放送する）。
+    """
+    raw = state.get(url)
+    if isinstance(raw, dict):
+        watermark = raw.get('watermark')
+        parsed = datetime.datetime.fromisoformat(watermark) if watermark else None
+        floor = raw.get('floor')
+        parsed_floor = datetime.datetime.fromisoformat(floor) if floor else parsed
+        return parsed, parsed_floor, list(raw.get('recent_ids', []))
+    if isinstance(raw, list):
+        print(f"Migrating legacy state for {url} (treating as first run).")
+    return None, None, []
+
+
+def host_covered_until(state, url, own_key):
+    """同じホストの別 RSS フィードが処理済みの範囲（その透かしの最大値）。無ければ None。
+
+    全体版のフィードを狭いフィードに置き換えると、新しいフィードは初回扱いになり最新 1 件を処理する。
+    その 1 件は置き換え前のフィードで放送済みのことが多い（2026-09-29 の置き換えで 4 件が再放送
+    される計算だった）。同じホストで既に通った時刻より古ければ、初回の 1 件は流さない。
+    """
+    host = urlparse(url).netloc
+    marks = []
+    for key, raw in state.items():
+        if key == own_key or key.startswith(('sitemap:', 'watch:')) or not isinstance(raw, dict):
+            continue
+        if raw.get('watermark') and urlparse(key).netloc == host:
+            marks.append(datetime.datetime.fromisoformat(raw['watermark']))
+    return max(marks) if marks else None
+
+
+def read_threshold(watermark, floor):
+    """この時刻以降の記事は「処理済み ID に無ければ未読」。None は初回（全件が未読）。"""
+    if watermark is None:
+        return None
+    lookback = watermark - LOOKBACK
+    return max(lookback, floor) if floor else lookback
+
+
+def is_unread(entry_id, ts, threshold, recent_ids):
+    # 処理済みの ID は、公開時刻が後から動いても既読（Vercel の日付付け直し、定期投稿の再浮上）
+    if entry_id in recent_ids:
+        return False
+    if threshold is None or ts is None:
+        return True
+    # threshold は透かしから LOOKBACK 遡った時刻。透かしと同時刻の記事や、前日付で後から現れた
+    # 記事は、処理済み ID に無い限り未読。ここを透かしちょうどで切ると、日付だけのフィードで
+    # 上限により持ち越した同日の記事が消え(2026-09-22 Cloudflare Changelog: 同日 7 件中 4 件)、
+    # 前日付で差し込まれた記事も消える(2026-09 の 7 日間で 14 件)。
+    return ts >= threshold
+
+
+def check_rss_feeds(config, state, now=None):
+    """(candidates, feed_results, warnings) を返す。state はまだ変更しない。"""
+    now = now or datetime.datetime.now(UTC)
+    candidates = []
+    feed_results = []
+    warnings = []
+
+    for feed_cfg in config.get('feeds', []):
+        name = feed_cfg.get('name')
+        url = feed_cfg.get('url')
+        topic = feed_cfg.get('topic', DEFAULT_TOPIC)
+        source_mode = feed_cfg.get('source_mode', 'url')
+        is_sitemap = feed_cfg.get('type') == 'sitemap'
+        print(f"Checking feed: {name} ({url})")
+
+        if is_sitemap:
+            feed, problem = fetch_sitemap_feed(url, feed_cfg['prefix'])
+        else:
+            feed, problem = fetch_feed(url)
+        if problem:
+            print(f"[{name}] Warning: {problem}")
+            warnings.append((name, problem))
+            continue
+
+        # categories: RSS のカテゴリで絞る（OpenAI の Company / Startup / Global Affairs のような
+        # 開発者向けでない投稿を落とす）。一致しない記事は最初から存在しないものとして扱うので、
+        # 既読状態にも透かしにも影響しない。
+        wanted = set() if is_sitemap else {c.strip().lower() for c in feed_cfg.get('categories', [])}
+        skipped_by_category = 0
+        entries = []
+        for entry in feed.entries:
+            eid = entry_key(entry)
+            link = getattr(entry, 'link', None)
+            if not eid or not link:
+                continue
+            if wanted and not wanted & entry_categories(entry):
+                skipped_by_category += 1
+                continue
+            entries.append(
+                {
+                    'id': eid,
+                    'ts': entry_time(entry),
+                    'title': getattr(entry, 'title', '(no title)'),
+                    'link': link,
+                    'feed_name': name,
+                    'feed_url': url,
+                    'topic': topic,
+                    # ボット対策で本文が取れないホストは、URLではなくRSSの配信内容を投入する
+                    'source_mode': source_mode,
+                    'summary': entry_summary(entry),
+                    'has_content': entry_has_content(entry, link),
+                }
+            )
+
+        if not entries and skipped_by_category:
+            # 絞り込みに合う記事が今の表示範囲に無いだけ（取得の失敗ではない）。通知はしない。
+            # 既読状態も作らないので、合う記事が現れた回が初回になり、その最新 1 件を処理する
+            print(f"[{name}] No entries in categories {sorted(wanted)} ({skipped_by_category} skipped).")
+            continue
+        if not entries:
+            print(f"[{name}] Warning: 有効なエントリがありません")
+            warnings.append((name, '有効なエントリがありません'))
+            continue
+
+        key = feed_state_key(feed_cfg)
+        if is_sitemap:
+            # sitemap は毎回全URLを返すので、既読URL集合の membership 判定が正確に成立する。
+            # lastmod は「最終更新日」であり、古い記事の修正で動く。watermark(時刻)で判定すると
+            # 4月の記事が7月の修正で「新着」に化けるので、lastmod は新着判定に使わない。
+            seen, _migrated = read_sitemap_state(state, key, url, entries)
+            first_run = seen is None
+            unread = entries if first_run else [e for e in entries if normalize_url(e['id']) not in seen]
+            result = {
+                'name': name,
+                'url': url,
+                'key': key,
+                'mode': 'sitemap',
+                'entries': entries,
+                'first_run': first_run,
+                'seen': seen or set(),
+            }
+        else:
+            watermark, floor, recent_ids = read_feed_state(state, key)
+            first_run = watermark is None
+            recent_set = set(recent_ids)
+            threshold = read_threshold(watermark, floor)
+            unread = [e for e in entries if is_unread(e['id'], e['ts'], threshold, recent_set)]
+            result = {
+                'name': name,
+                'url': url,
+                'key': key,
+                'mode': 'rss',
+                'entries': entries,
+                'first_run': first_run,
+                'watermark': watermark,
+                'floor': floor,
+                'recent_ids': recent_ids,
+            }
+
+        # 余裕(headroom) = あと何件の新着で、その記事がフィードの表示範囲から押し出されるか。
+        # 全体上限で枠が足りない回は、余裕の小さい記事から処理する（select_articles）。
+        # sitemap は毎回全 URL を返すので押し出されない。
+        if is_sitemap:
+            for e in entries:
+                e['_headroom'] = NEVER_SCROLLS_OUT
+        else:
+            by_age = sorted(entries, key=lambda e: e['ts'] or EPOCH, reverse=True)
+            for rank, e in enumerate(by_age):
+                e['_headroom'] = len(by_age) - rank
+
+        unread.sort(key=lambda e: e['ts'] or EPOCH)
+        latest_mode = feed_cfg.get('mode') == 'latest' and not is_sitemap
+        result['latest'] = latest_mode
+
+        # 鮮度の足切り（settings.max_age_hours）: 公開から時間が経ちすぎた記事は流さない。朝に最新情報を
+        # 聞くためのラジオで、障害明けの溜まった記事や前日付で遅れて現れた記事を何日も後に流しても意味がない。
+        # 「処理していない記事を既読にしない」の明示的な例外（mode: latest と同じ扱い）。見送った記事は
+        # 既読にして Slack に一覧を出す（黙って消さない）。日付のない記事と sitemap は判定しない。
+        # 実行のたびの点検。どちらも設定か取りこぼしの問題なので、直るまで毎回知らせる
+        if not is_sitemap and not first_run and not latest_mode:
+            if len(entries) >= WINDOW_WARN_MIN and len(unread) == len(entries):
+                warnings.append(
+                    (
+                        name,
+                        f'表示されている {len(entries)} 件がすべて未読。これより古い記事は処理する前にフィードから'
+                        '消えたかもしれない（1 回の上限を上げるか、狭いフィードに替える）',
+                    )
+                )
+        if not is_sitemap and source_mode != TEXT_SOURCE_MODE:
+            pages = Counter(urldefrag(e['link']).url for e in entries if urldefrag(e['link']).fragment)
+            shared = sum(n for n in pages.values() if n >= 2)
+            if shared:
+                warnings.append(
+                    (
+                        name,
+                        f'{shared} 件の記事リンクが同じページの # 位置を指している。URL のままだとページ全体が毎回'
+                        '入るので、source_mode: text にする',
+                    )
+                )
+
+        stale = []
+        if MAX_AGE_HOURS and not is_sitemap:
+            cutoff = now - datetime.timedelta(hours=MAX_AGE_HOURS)
+            stale = [e for e in unread if e['ts'] is not None and e['ts'] < cutoff]
+            if stale:
+                unread = [e for e in unread if e['ts'] is None or e['ts'] >= cutoff]
+        if stale and not first_run and not latest_mode:
+            # 初回と latest は残りを全部既読にする回なので、見送りとして数えない（通知もしない）
+            result['skipped'] = stale
+            print(f"[{name}] Skipping {len(stale)} article(s) older than {MAX_AGE_HOURS}h.")
+            for e in stale:
+                print(f"[{name}] Stale, not aired: {e['link']}")
+
+        if first_run and is_sitemap:
+            # sitemap の lastmod は「更新日」なので、どれが最新の記事かは決められない。lastmod 順で
+            # 1 件選ぶと、編集されただけの古いページや記事でないページを流してしまう
+            # （Claude Code の週まとめで 4 月の Week 14、anthropic.com/claude- で募集ページを選んでいた）。
+            # 初回は既読化だけにして、次回以降に現れた URL から放送する。
+            picked = []
+            print(
+                f"[{name}] First run: marking all {len(entries)} URLs as read (a sitemap cannot tell which is newest)."
+            )
+        elif is_sitemap and len(unread) > max(SITEMAP_REBASELINE_MIN, len(entries) // 2):
+            # 一度に半分以上の URL が未読 = 記事が増えたのではなく URL の形式が変わった（末尾の /、
+            # 言語パスの付け替え等）。流すと古い記事の再放送になるので、既読を今の URL で付け直す
+            picked = []
+            result['rebaseline'] = True
+            warnings.append(
+                (
+                    name,
+                    f'URL {len(entries)} 件のうち {len(unread)} 件が一度に未読になった。URL の形式が変わったとみなし、'
+                    '流さずに既読を付け直した',
+                )
+            )
+            print(f"[{name}] {len(unread)}/{len(entries)} URLs look new at once: re-baselining instead of airing.")
+        elif first_run:
+            # 初回は最新1件だけ処理し、残りは既読にする（過去記事の洪水を防ぐ）
+            picked = unread[-1:]
+            covered = host_covered_until(state, url, key)
+            if picked and covered and picked[0]['ts'] and picked[0]['ts'] <= covered:
+                # 同じホストの別フィード（置き換え前の全体版など）がこの時刻までを処理済み。
+                # 最新 1 件も放送済みの可能性が高いので、初回は既読化だけにする
+                picked = []
+                print(
+                    f"[{name}] First run: marking all {len(entries)} entries as read (already covered by a feed on this host)."
+                )
+            else:
+                print(f"[{name}] First run: marking all {len(entries)} entries as read, processing the latest one.")
+        elif latest_mode:
+            # アグリゲータ向け（mode: latest）: 古い順に消化せず「最新 N 件」だけ拾い、残りの未読は
+            # 意図的に既読にする。「処理していない記事を既読にしない」ルールのフィード単位の例外で、
+            # 流量の多いフィードが永遠に古い記事を流し続けるのを避けるための選択（docs/DESIGN.md）。
+            picked = unread[-MAX_ARTICLES_PER_FEED:]
+            if len(unread) > len(picked):
+                print(
+                    f"[{name}] latest mode: processing the newest {len(picked)} of {len(unread)} unread; skipping the rest."
+                )
+        else:
+            # 古い順に処理する。上限を超えた分は「既読にせず」次回に持ち越す
+            picked = unread[:MAX_ARTICLES_PER_FEED]
+            if len(unread) > len(picked):
+                print(f"[{name}] {len(unread)} unread; processing {len(picked)}, carrying over the rest.")
+
+        for article in picked:
+            article['_first_run'] = first_run
+            # 全体上限(select_articles)で落とさないための印。初回分と mode: latest 分は常に通す
+            # （latest は最新記事なので、古い順の全体上限に掛けると毎回真っ先に落ちてしまう）
+            article['_priority'] = first_run or latest_mode
+            print(f"[{name}] New article: {article['title']}")
+
+        candidates.extend(picked)
+        feed_results.append(result)
+
+    return candidates, feed_results, warnings
+
+
+def _advance_sitemap_state(state, result, processed_ids, now):
+    """sitemap 型の既読URL集合を進める。処理できなかった未読は集合に入れず持ち越す。"""
+    current_ids = {normalize_url(e['id']) for e in result['entries']}
+    picked_here = current_ids & {normalize_url(i) for i in processed_ids}
+
+    if result['first_run'] or result.get('rebaseline'):
+        seen = current_ids  # 初回・URL 形式の付け替え時は、今の URL をすべて既読にする
+    else:
+        # sitemap から消えたURLは追跡をやめる（集合が sitemap のサイズを超えて肥大しない）
+        seen = (result['seen'] | picked_here) & current_ids
+
+    key = result['key']
+    prev = state.get(key)
+    legacy = state.get(result['url'])
+    entry = {'seen': sorted(seen)}
+    if result['first_run'] or picked_here:
+        entry['last_new'] = now.isoformat()
+    else:
+        # 新着なしでも last_new は引き継ぐ（停滞フィード検知のため）。移行時は旧形式から
+        for source in (prev, legacy):
+            if isinstance(source, dict) and source.get('last_new'):
+                entry['last_new'] = source['last_new']
+                break
+    state[key] = entry
+    # 旧形式（URLキー + watermark）は移行済みなので掃除する
+    state.pop(result['url'], None)
+
+
+def record_run(state, now, aired, skipped, blocked, first_runs):
+    """この回に流したもの・見送ったもの・取り込めなかったものを state に残す（直近 MAX_RUN_HISTORY 回）。
+
+    週 1 回の点検（scripts/weekly_check.py）が、フィードの中身と突き合わせて取りこぼしと二重放送を数えるために使う。
+    実行ログは 90 日で消え、取り出すにも API が要るので、読み取りだけで済む state に置く。
+    """
+    runs = state.get(RUNS_KEY)
+    runs = runs if isinstance(runs, list) else []
+    runs.append(
+        {'at': now.isoformat(), 'aired': aired, 'skipped': skipped, 'blocked': blocked, 'first_run': first_runs}
+    )
+    state[RUNS_KEY] = runs[-MAX_RUN_HISTORY:]
+
+
+def advance_state(state, feed_results, processed, now=None):
+    """実際に処理できた記事の分だけ既読を進める。"""
+    now = now or datetime.datetime.now(UTC)
+    processed_ids = {a['id'] for a in processed}
+    # 同じ URL を複数のフィードが配信していた場合、ノートブックに入ったのは 1 件でも
+    # 全フィードで「処理済み」として既読を進める(dedupe_by_link と対)。GUID はフィードごとに違う
+    processed_links = {a['link'] for a in processed if a.get('link')}
+
+    def is_processed(entry):
+        return entry['id'] in processed_ids or entry.get('link') in processed_links
+
+    for result in feed_results:
+        if result.get('mode') == 'sitemap':
+            _advance_sitemap_state(state, result, processed_ids | processed_links, now)
+            continue
+
+        key = result['key']
+        entries = result['entries']
+        prev_watermark = result['watermark']
+
+        picked = [e for e in entries if is_processed(e)]
+        # 初回はフィード全体を既読にする。mode: latest も、拾った回は残りの未読を意図的に既読にする
+        # （拾えなかった回 = トピック失敗時は何も進めず、次回また最新を拾い直す）
+        mark_all = result['first_run'] or (result.get('latest') and picked)
+        if mark_all:
+            dated = [e['ts'] for e in entries if e['ts']]
+        else:
+            # 鮮度の足切りで見送った記事も「読み終えた」扱いにする（次回また見送り通知を出さない）
+            consumed = picked + [e for e in result.get('skipped', []) if e not in picked]
+            if not consumed:
+                continue  # このフィードからは何も処理していない → 変更なし
+            # 日付なしの記事しか処理しなかった場合も、既読(recent_ids)の記録は必要。
+            # その場合 dated が空なので透かしは進めず維持する。
+            dated = [e['ts'] for e in consumed if e['ts']]
+
+        # 透かしは戻さない（フィードが縮んでも）。未来日付の記事では「今」より先へ進めない:
+        # 誤った日付 1 件で透かしが未来へ飛ぶと、その日までの記事が全部既読扱いになる。
+        new_watermark = max(dated) if dated else EPOCH
+        if new_watermark > now:
+            new_watermark = now
+        if prev_watermark:
+            new_watermark = max(new_watermark, prev_watermark)
+        # 振り返りの下限。初回はこの時点の透かし（それ以前は全件既読にしたので遡る必要がない）
+        floor = new_watermark if result['first_run'] else result.get('floor') or prev_watermark
+        threshold = read_threshold(new_watermark, floor)
+
+        if mark_all:
+            # 全件既読。振り返り範囲に入る記事と日付なしの記事は、時刻では既読と判定できないので ID で覚える
+            recorded = [e['id'] for e in entries if e['ts'] is None or e['ts'] >= threshold]
+        else:
+            # 処理した記事は時刻に関係なく ID で覚える（公開時刻が後から動いても再放送しない）。
+            # 記録するのは「処理した」ものだけ。未処理の分まで載せると、持ち越したはずの記事や
+            # 前日付で差し込まれた記事が既読扱いで消える。is_unread が振り返り範囲を未読に倒して
+            # いるのは、このリストが処理済みの ID を正確に持つことが前提（見送りは意図的な既読なので載せる）。
+            recorded = [e['id'] for e in consumed]
+
+        merged = list(dict.fromkeys([*result['recent_ids'], *recorded]))
+        kept = merged[-MAX_RECENT_IDS:]
+
+        # 振り返り範囲の記事と日付なしの記事は、透かしでは既読判定できずこのリストにしか記録がない。
+        # 上限で溢れさせると未読に戻ってしまうので、必ず残す（毎週日付が進む定期投稿もここで残り続ける）
+        must_keep = {e['id'] for e in entries if e['ts'] is None or e['ts'] >= threshold}
+        rescued = [i for i in merged if i in must_keep and i not in kept]
+
+        state[key] = {
+            'watermark': new_watermark.isoformat(),
+            'floor': floor.isoformat(),
+            'recent_ids': rescued + kept,
+            # 最後に新着を確認した日時。停滞フィードの検知(check_stale_feeds)に使う。
+            'last_new': now.isoformat(),
+        }
+
+
+def notebook_title_for(config, topic=None, now=None):
+    """ノートブック名は LOCAL_TZ（既定 JST）基準。runner は UTC なので明示しないと朝の回が前日名になる。"""
+    now = now or datetime.datetime.now(LOCAL_TZ)
+    today_str = now.astimezone(LOCAL_TZ).strftime('%Y-%m-%d')
+    template = config.get('settings', {}).get('notebook_title_format', 'Tech Radio {date}')
+    return template.format(date=today_str, topic=topic or DEFAULT_TOPIC)
+
+
+def dedupe_by_link(candidates):
+    """フィードをまたいで同じ URL の記事を 1 つにする(先勝ち)。
+
+    同じ記事を配信する 2 つのフィード(例: vercel.com/blog/feed と vercel.com/atom は同一内容)を
+    両方購読すると、同じ URL が 2 回ソース投入され、通知に 2 行出て、1 回あたりの上限枠も
+    2 つ消費していた。落とした側のフィードの既読は advance_state が URL で照合して進める。
+    """
+    unique, seen_links = [], set()
+    for article in candidates:
+        link = article.get('link')
+        if link and link in seen_links:
+            continue
+        if link:
+            seen_links.add(link)
+        unique.append(article)
+    if len(unique) < len(candidates):
+        print(f"Dropped {len(candidates) - len(unique)} duplicate URL(s) shared across feeds.")
+    return unique
+
+
+def _is_priority(article):
+    return bool(article.get('_priority') or article.get('_first_run'))
+
+
+def select_articles(candidates):
+    """全体上限を適用する。初回実行分（各フィード1件）と mode: latest 分（各フィード N 件）は常に通す。
+
+    残りの枠は、フィードの表示範囲から押し出されるまでの余裕が小さい記事から埋め、同じ余裕なら古い順。
+    全体を古い順だけで切ると、障害明けのように古い記事を溜めたフィードが毎回枠を使い切り、
+    表示件数の少ないフィードの記事が枠を得る前にフィードから消える（2026-08-20〜09-13 に 135 件。
+    うち GitHub Changelog は 10 件 ≒ 1 日分しか表示せず、152 件中 101 件を失った）。
+    同じフィードの中では古いほど余裕が小さいので、フィード内の「古い順に消化」は変わらない。
+    """
+    candidates = dedupe_by_link(candidates)
+    priority = [a for a in candidates if _is_priority(a)]
+    rest = sorted(
+        [a for a in candidates if not _is_priority(a)],
+        key=lambda e: (e.get('_headroom', NEVER_SCROLLS_OUT), e['ts'] or EPOCH),
+    )
+
+    remaining = max(MAX_ARTICLES_TOTAL - len(priority), 0)
+    selected = priority + rest[:remaining]
+    if len(selected) < len(candidates):
+        print(f"Capping articles from {len(candidates)} to {len(selected)}.")
+    return selected
+
+
+def check_config_command():
+    """`--check-config`: config.yaml を検査して終了する。
+
+    ネットワークにも NotebookLM にも state.json にも触れない（副作用ゼロ）。CI の test ジョブと
+    ローカルの確認用。壊れた config は batch が走る前にここで止まる。
+    """
+    try:
+        config = load_config()
+        warnings = validate_config(config)
+    except (ConfigError, yaml.YAMLError, OSError) as e:
+        print(f"config.yaml NG\n{e}", file=sys.stderr)
+        return 1
+    for warning in warnings:
+        print(f"warning: {warning}")
+    feeds = config.get('feeds') or []
+    default_topic = (config.get('settings') or {}).get('default_topic', DEFAULT_TOPIC)
+    topics = sorted({f.get('topic', default_topic) for f in feeds})
+    print(f"config.yaml OK: {len(feeds)} feed(s), topics: {', '.join(topics)}")
+    return 0
+
+
+def main():
+    if '--check-config' in sys.argv[1:]:
+        sys.exit(check_config_command())
+
+    webhook_url = os.environ.get('NOTIFY_WEBHOOK_URL')
+    notebook_title = None
+
+    try:
+        # 設定の読み込みと検査も try の中で行い、壊れた config も（ログだけでなく）通知に出す
+        config = load_config()
+        for warning in validate_config(config):
+            print(f"Config warning: {warning}")
+        apply_settings_overrides(config)
+        state = load_state()
+
+        candidates, feed_results, warnings = check_rss_feeds(config, state)
+
+        # ページ更新監視（Slack通知のみ、ラジオ化しない）。失敗しても本体は止めない
+        try:
+            warnings += check_watch_pages(config, state, webhook_url)
+        except Exception as e:
+            print(f"Warning: watch check failed: {redact(e)}", file=sys.stderr)
+            warnings.append(('ページ更新監視', f'失敗: {type(e).__name__}'))
+
+        if warnings:
+            send_feed_warning(webhook_url, warnings)
+        # 鮮度の足切りで見送った記事（黙って消さず、一覧を知らせる）
+        send_stale_notification(webhook_url, [e for r in feed_results for e in r.get('skipped', [])])
+
+        run_at = datetime.datetime.now(UTC)
+        stale_links = [e['link'] for r in feed_results for e in r.get('skipped', [])]
+        first_runs = [r['name'] for r in feed_results if r['first_run']]
+
+        if not candidates:
+            print("No new articles detected.")
+            send_no_news_notification(webhook_url)
+            advance_state(state, feed_results, [])
+            record_run(state, run_at, [], stale_links, [], first_runs)
+            save_state(state)
+            run_maintenance(config, state, webhook_url)
+            return
+
+        new_articles = select_articles(candidates)
+        print(f"Detected {len(new_articles)} new articles in total.")
+
+        # トピック(AI / Infra)ごとに別ノートブックへ。混ぜるとラジオの話題が散らかるため
+        by_topic = {}
+        for art in new_articles:
+            by_topic.setdefault(art.get('topic', DEFAULT_TOPIC), []).append(art)
+
+        processed = []  # 実際にノートブックへ入った（または取り込み不能と確定した）記事
+        blocked = []  # ボット対策ページで中身が取れなかった [(url, title)]
+        failures = []  # (notebook_title, exception) ノートブック作成・ソース投入の失敗。記事は持ち越す
+        audio_failures = []  # (notebook_title, exception) ソースは入ったが音声を開始できなかった。記事は既読
+        notebooks = {}  # topic -> (title, notebook_id)。通知にノートブックへのリンクを載せる
+        no_audio = set()  # 音声を開始しなかった/できなかったトピック。通知で「開始した」と言わない
+        for topic, articles in by_topic.items():
+            notebook_title = notebook_title_for(config, topic=topic)
+            try:
+                # 1. ノートブックの取得・作成
+                notebook_id = get_or_create_notebook(notebook_title)
+                notebooks[topic] = (notebook_title, notebook_id)
+
+                # 2. ソースの追加 & 待機（ボット対策ページを掴んだソースはここで除去される）
+                usable_ids, topic_blocked = add_sources_and_wait(notebook_id, articles)
+
+                # 3. ラジオの生成トリガー（音声設定は topics.<topic>.audio → settings.audio の順）
+                if usable_ids:
+                    audio = audio_settings_for(config, topic)
+                    try:
+                        generate_audio(
+                            notebook_id,
+                            language=audio['language'],
+                            prompt=audio.get('prompt'),
+                            length=audio.get('length'),
+                            fmt=audio.get('format'),
+                            # scope: run（既定）= この回に入れた記事だけで 1 本。夕方の回が朝の記事を再放送しない
+                            source_ids=usable_ids if audio.get('scope', 'run') == 'run' else None,
+                        )
+                    except Exception as e:
+                        # ソースは既にノートブックに入っている。記事を未読のまま残すと次回また同じ URL を
+                        # 投入して重複するだけなので既読にし、音声だけ失敗として別枠で報告する
+                        # （日次の生成上限に当たると CLI は rate_limited で失敗する）
+                        print(f"[{topic}] Audio generation failed: {redact(e)}", file=sys.stderr)
+                        audio_failures.append((notebook_title, e))
+                        no_audio.add(topic)
+                else:
+                    print(f"[{topic}] No usable sources; skipping audio generation.")
+                    no_audio.add(topic)
+
+                processed.extend(articles)
+                blocked.extend(topic_blocked)
+            except Exception as e:
+                # 片方のトピックが失敗しても、もう片方のラジオは配信する
+                print(f"Error processing topic '{topic}': {redact(e)}", file=sys.stderr)
+                failures.append((notebook_title, e))
+
+        # 4. 通知の送信（取り込めなかった記事は「生成開始」の一覧に載せず、正直に別枠で報告）
+        blocked_urls = {url for url, _title in blocked}
+        listed = [a for a in processed if a['link'] not in blocked_urls]
+        if listed or blocked:
+            send_notification(webhook_url, listed, blocked, notebooks, no_audio)
+
+        # 5. 状態保存（処理できたトピックの記事の分だけ既読を進める。失敗分は次回に持ち越す）
+        advance_state(state, feed_results, processed)
+        record_run(state, run_at, [a['link'] for a in listed], stale_links, sorted(blocked_urls), first_runs)
+        save_state(state)
+
+        # 6. メンテナンス（古いラジオの削除・停滞フィード検知。失敗しても本体は成功扱い）
+        run_maintenance(config, state, webhook_url)
+
+        if failures or audio_failures:
+            for title, e in failures:
+                send_error_notification(webhook_url, describe_failure(e), title)
+            for title, e in audio_failures:
+                send_error_notification(webhook_url, f"{AUDIO_FAILED_NOTE}\n\n{describe_failure(e)}", title)
+            sys.exit(1)
+        print("Batch process completed successfully.")
+
+    except Exception as e:
+        import traceback
+
+        print(f"Unexpected error: {redact(traceback.format_exc())}", file=sys.stderr)
+        send_error_notification(webhook_url, describe_failure(e), notebook_title)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

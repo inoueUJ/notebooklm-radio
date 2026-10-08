@@ -1,0 +1,125 @@
+# Design notes
+
+This document records the load-bearing design decisions and the incidents that forced them. If you change behavior in `radio_batch.py`, read the relevant section first — most of the non-obvious code exists because the obvious version failed in production.
+
+## Architecture at a glance
+
+A single ~1,100-line Python module, run twice daily by GitHub Actions cron. No server, no database. Persistent state is one JSON file (`state.json`) committed back to the repository by the bot after every run. NotebookLM is driven by shelling out to the [notebooklm-py](https://github.com/teng-lin/notebooklm-py) CLI; credentials are inherited via the environment and never read by this code.
+
+Per run: poll feeds → decide what's new → one notebook per topic per day → add articles as sources → wait for ingestion → remove junk sources → trigger the Audio Overview (fire-and-forget) → notify → advance read-state → maintenance (cleanup, stale-feed report).
+
+## Read-state: two mechanisms, deliberately different
+
+This is the heart of the project. There are two kinds of feeds and each gets a different read-state mechanism. **They must not be swapped** — each one is provably wrong for the other feed type.
+
+### RSS feeds use a watermark
+
+```json
+{ "https://vercel.com/blog/feed": { "watermark": "2026-07-09T00:00:00+00:00", "recent_ids": ["..."] } }
+```
+
+The watermark is the publish time of the newest article ever processed. On its own it would say "an entry is unread iff its timestamp is newer", and that is almost what the code does — with two corrections that real feeds forced (below).
+
+**Why not a seen-ID list?** Because an ID list cannot be simultaneously *bounded* and *correct* for RSS. Vercel's feed returns 1,325 entries; any list you trim will "forget" old entries, and a forgotten entry that is still in the feed comes back as unread — forever. This is not hypothetical: the original ID-list implementation produced **1,226 falsely-new articles in one run**, followed by a permanent two-run oscillation as trimmed halves of the feed took turns looking new. A timestamp is monotonic; it doesn't care how many entries the feed returns or how many IDs you throw away.
+
+**Correction 1 — a lookback window.** Feeds are not published in timestamp order. Items appear hours or days *after* newer items, carrying their earlier date: on 2026-09-23 OpenAI published a 13:00 post, the batch processed it, and then seven posts dated 01:00–12:00 appeared; Cloudflare's changelog regularly back-fills entries two days late. Under a pure watermark each of these is "older than the watermark" the moment it appears, so it is read without ever being processed — 37 articles in September. So an entry is unread iff it is not in `recent_ids` **and** its timestamp is at least `watermark − LOOKBACK` (7 days; the worst observed delay was just over 2 days). Anything older than that stays read no matter what, so the sliding-window problem above cannot come back: the window is bounded by time, not by a list.
+
+**Correction 2 — every processed ID is remembered.** Publishers move timestamps *forward* too. Vercel re-dates edited posts (its Atom feed has only `<updated>`), and a post aired on 09-26 was aired again on 09-29; rolling posts such as Cloudflare's "scheduled WAF changes" and Google Cloud's "What's new" get a new date every week. Anything re-dated past the watermark looks new. So `recent_ids` records **every processed article**, and an ID found there is read regardless of its timestamp. The list stays bounded (`MAX_RECENT_IDS`), but IDs of entries currently inside the lookback window — and of dateless entries — are never trimmed, because the list is their only read-marker; a rolling post keeps its ID for as long as it keeps getting re-dated.
+
+What the list must never contain is an *unprocessed* article: an entry inside the window that is not in `recent_ids` is unread, which is what lets carried-over and late articles through. (The same rule fixed the 2026-09-22 incident: Cloudflare published 7 changelog entries on one date-only day, the per-feed limit took 3, and the old code, which treated `ts == watermark` as read and recorded every entry at that time, lost the other 4.)
+
+**The floor.** The window never reaches back before `floor`, the watermark at which a feed started being tracked this way. State written before the lookback existed only recorded same-timestamp IDs, so looking back past its watermark would re-air a week of already-processed articles; for such state `floor` is taken to be its current watermark. A feed's first run sets `floor` to its first watermark (everything older was marked read on purpose).
+
+**The watermark stops at "now".** A single future-dated entry (a typo'd year, a timezone slip) would otherwise push the watermark into the future and silently mark everything up to that date as read. The processed ID keeps the future-dated entry itself from being aired twice.
+
+**Two feeds that publish the same URL** (Vercel's `blog/feed` and `atom` are identical) are deduplicated by URL before selection; the article is added once, and read-state advances in both feeds because `advance_state` matches processed articles by URL as well as by ID (GUIDs differ per feed).
+
+### Sitemap feeds use a seen-URL set
+
+```json
+{ "sitemap:https://www.anthropic.com/sitemap.xml:https://www.anthropic.com/news/": { "seen": ["..."] } }
+```
+
+**Why not a watermark?** Sitemap `<lastmod>` is a *last-modified* date, not a publish date. Editing an old article bumps it past any watermark, and the article resurfaces as "new". This happened on 2026-07-13: an April article reappeared in the radio because someone touched it in July. So `lastmod` is never used for newness.
+
+A seen-set is correct *and* bounded here because a sitemap returns its full URL set every run: membership checks are exact, and the set is intersected with the current sitemap so it can never outgrow it. The sliding-window problem that rules out ID lists for RSS structurally cannot occur.
+
+**The state key includes the URL prefix**, not just the sitemap URL. Two configured feeds can share one physical sitemap (e.g. `/news/` and `/engineering/` on the same domain); when they shared a state key, one feed's articles were silently marked read by the other. That silent loss is why the key is `sitemap:{url}:{prefix}`.
+
+**URLs are compared without a trailing slash, and a mass change is treated as a re-shuffle, not news.** On 2026-09-29 antigravity.google started listing every blog URL with a trailing `/`; none matched the seen-set, all 24 posts looked new, and an old post aired. Seen-set membership now ignores a trailing slash, and if more than half of a sitemap's URLs (and at least five) turn unread at once, the run marks the current URLs as seen, airs nothing, and says so in the feed-warning notification — a site that changes its URL scheme (a slash, a locale path) must not re-air its archive.
+
+### Invariants that follow
+
+- **Never mark an article read that wasn't processed.** Articles beyond the per-run limits stay unread and are drained oldest-first on later runs.
+- **Read-state advances and saves even when there are no new articles** — a feed's first-run initialization must persist. Do not add an early return that skips it.
+- **A feed that fails to fetch must not initialize its state.** Otherwise a temporary 404 marks the entire backlog as read.
+- **An entry inside the lookback window that is not in `recent_ids` is unread.** `recent_ids` must therefore hold processed entries only — never unprocessed ones — and must not drop the IDs of entries that are still inside the window.
+- **Within the per-run total, articles closest to scrolling out of their feed go first.** A feed only shows its newest N items; an article that is not processed before N newer ones appear is gone. Ordering the total cap purely oldest-first let feeds with an old backlog take every slot after the 2026-08 outage, while GitHub Changelog (10 items, about a day) got no slot for 30 runs and lost 101 of 152 posts. The cap is now filled by "headroom" (how many new posts until the article drops out), then age; inside one feed the oldest article always has the least headroom, so each feed still drains oldest-first. Sitemaps never scroll out and go last.
+- **An article whose sources were added but whose audio could not be started is still marked read.** The sources are already in the notebook; leaving the article unread would only re-add the same URLs next run. The failure is reported separately, with the CLI's error code (e.g. `rate_limited` when the daily Audio Overview quota is hit).
+- First run per RSS feed processes only the newest article and marks the rest read — no backlog flood on day one. **A sitemap's first run processes nothing**: `lastmod` is an edit date, so "the newest page" cannot be known, and picking by `lastmod` aired an April digest and a recruiting page when new sitemap feeds were added. New URLs are aired from the second run on. **An RSS feed's first pick is also skipped when another feed on the same host has already processed up to that time** — replacing a firehose with a narrower feed from the same site (a label or category feed) would otherwise re-air an article the old feed aired days ago; four such re-airs were due on 2026-09-29.
+- **`settings.max_age_hours` is the second deliberate exception**, opt-in for the whole deployment. A morning news show gains nothing from airing a two-week-old announcement: after the 2026-08 credential outage the author's radio aired articles a median of 14.5 days after publication for two weeks. With the setting, a dated RSS entry older than the limit is marked read instead of processed, and every skipped article is listed in one notification — skipped, never silently lost. Sitemap URLs and undated entries are never judged stale (a sitemap's dates are edit dates), and a feed's first run doesn't count as skipping.
+- **`mode: latest` is the other deliberate exception** to "never mark unread articles read", and it is opt-in per feed. An aggregator that publishes hundreds of items a month cannot be drained oldest-first at three per run without airing week-old items forever; for such feeds the user chooses "the newest N each run, the rest is read". A run that processes nothing from such a feed (its topic failed) advances nothing, so the next run picks the newest again. Sitemaps ignore it — a seen-set looks at the full URL set every run, so there is no backlog to skip.
+
+## Topic split
+
+Each feed maps to a `topic`, and each topic gets its own daily notebook and its own audio generation. Mixing AI news and infrastructure changelogs in one conversation produced incoherent radio. Topics fail independently: one topic's error doesn't stop the other's episode, read-state advances only for articles whose topic succeeded, and the run exits non-zero at the end if anything failed.
+
+**Per-topic audio.** `topics.<name>.audio` overrides `settings.audio` for one topic (`format`, `length`, `prompt`, `language`), resolved by `audio_settings_for`. A changelog topic can be a short *brief* while the AI topic stays a long *deep-dive*. Cleanup recognizes topic names from this section as well as from `feeds[].topic`, so a topic whose feeds were removed still gets its old notebooks deleted.
+
+**Episodes cover the run, not the day.** Two runs a day share one notebook per topic, but the second Audio Overview is generated with `-s` limited to the sources added in *that* run (`settings.audio.scope: run`, the default). Before this, the evening episode re-discussed every morning article. `scope: notebook` restores the old whole-notebook behavior.
+
+**Quota is the real limit on splitting.** NotebookLM caps Audio Overviews per day (3 on the free tier, 6 on Plus, 20 on Pro). Every topic × every run is one generation, so two topics twice a day already exceed the free tier; the fourth trigger fails with `rate_limited`, the articles stay in the notebook and are marked read, and the failure is reported. Choose the number of topics and runs with that arithmetic in mind.
+
+## Configuration is validated, not trusted
+
+`validate_config` runs before anything else, and `python radio_batch.py --check-config` runs it alone (CI does the same before every batch). Unknown keys are **errors**, not warnings: a `feed:` typo used to yield zero feeds and a cheerful "nothing new today", and a `topics:` inside a feed silently routed it to the default topic. The same rules are published as `config.schema.json` so that a config builder can only produce what the runtime accepts. This is not a dry-run mode for the batch — it reads one file and touches nothing else.
+
+## Cleanup: the full-match guarantee
+
+`cleanup_old_notebooks` deletes notebooks whose title **fully matches** `notebook_title_format` with a `YYYY-MM-DD` date, older than `retention_days`. `{topic}` expands only to topic names that actually exist in the config — never to a wildcard. This full-match rule is the *entire* safety guarantee that your manually created notebooks are untouchable. Never loosen it to substring or prefix matching. `dry_run: true` (the shipped default) posts the would-delete list instead of deleting.
+
+## Hostile fetch targets
+
+Two related problems, one honest policy.
+
+**`source_mode: text`** exists because for some feeds the article URL never gives NotebookLM the article. There are two ways this happens:
+
+- **Bot-protected hosts.** Some hosts (e.g. `openai.com` article pages) return a bot challenge (`403`, `cf-mitigated: challenge`) to every non-browser client, so NotebookLM's fetcher stores the challenge page instead of the article. Retries can never fix this — the block is on their side.
+- **Anchor-linked changelogs.** Some changelog feeds link every entry to a `#fragment` of one long page (Codex, Claude Code). NotebookLM drops the fragment and imports the entire page — every release ever published — once per entry: on 2026-09-23 one notebook held three identical copies of the Codex changelog page, and the episode was scoped to "this run's sources" in name only.
+
+Such feeds are submitted as text sources built from the feed item itself, which never touches the fetcher. The text **must** say what it contains. When the item carries a body — `content:encoded` or Atom `<content>`, or any text at all when its link is an `#anchor` on a single changelog page (the item's text *is* the entry; Claude Platform's release notes put each day's complete notes in `<description>`) — the source is that body, labeled as the feed's text. Length is deliberately not the test: OpenAI's summaries run up to 683 characters while a short day of release notes is under 100. When it carries only a description, the source keeps its leading disclaimer that it is a summary, not the full article: some feeds ship only a ~150-character description, and a radio that assumes it read the full article will invent facts. Notifications mark the summary-only articles.
+
+**Junk-source detection**: `source add` can "succeed" while storing a challenge page — the source becomes ready with a title like "Just a moment...". After the ingestion wait, sources whose titles match the challenge-page regex are deleted and reported as not-included. If *all* of a topic's sources were junk, audio generation is skipped (regenerating from the notebook's stale sources would be worse than silence), but the articles are still marked read — retrying would fetch the same challenge page. Text-mode sources are excluded from this check: their titles are ones we set ourselves.
+
+**The policy**: this project does **not** spoof a browser User-Agent to get past bot protection. That would be evading someone else's explicit access decision. We settle for less content instead, and we say so honestly in the output. The fetch User-Agent identifies this software and links back to its repository.
+
+## Things this project deliberately does not do
+
+Documented so they aren't "fixed" casually:
+
+- **No backend abstraction over the notebooklm CLI (yet).** All CLI calls sit behind ~8 conceptual operations (list/create/delete notebook, add/wait/list/delete source, generate audio), so an adapter seam exists on paper. It stays unbuilt until a concrete second backend (e.g. an official API) gives it a reason to exist. Abstractions built for one implementation are speculation.
+- **Not a pip library.** notebooklm-py owns the client-library niche; this is an application template. The value is the pipeline and its operational hardening, not an importable API.
+- **No notification plugin system.** Slack and Discord are auto-detected from the webhook URL; that covers the realistic cases at near-zero complexity.
+- **No dry-run mode for the batch itself.** The script's side effects are the product. Verification is `pytest -q` (no network — the CLI boundary and feed fetching are monkeypatched); real execution happens only via `gh workflow run`. `--check-config` is not a dry run: it validates `config.yaml` and exits without touching feeds, NotebookLM or state.
+- **No User-Agent spoofing.** See above.
+
+## Weekly check: verification, not just monitoring
+
+The per-run notifications say what happened in one run. They can't say what *didn't* happen — an article that scrolled out of a feed before it was processed leaves no trace in any run. The 279 lost articles of September were only found by reconciling a month of logs against the feeds. `scripts/weekly_check.py` (its own workflow, Sunday) makes that reconciliation routine:
+
+- **Feed health** runs the batch's own fetch and read-state code on a *copy* of `state.json` — the same warnings the batch would raise, plus a fetch of each URL-mode feed's newest article to catch challenge pages and empty (JavaScript-only) pages before they become junk sources.
+- **Reconciliation** needs to know what was aired. Run logs expire after 90 days and need API access, so the batch keeps its last 30 runs in `state.json` under `_runs` (`aired`, `skipped`, `blocked`, `first_run`). An RSS article published in the window (older than 24 h, so the next run has had its chance) that was neither aired, skipped as stale, nor blocked, and is not still waiting as unread, is reported as **not aired** — a loss nobody has explained yet. Sitemaps are left out: their dates are edit dates.
+- **Recall** (opt-in, `weekly_check.recall`) asks NotebookLM's Deep Research for the week's official announcements and sorts what it finds: aired, present in a feed (skipped or filtered), **on a followed site but in no feed** (a subscription gap — this is how `anthropic.com/claude-opus-5-5` would have surfaced), or elsewhere. It uses the CI credential the batch already has; the notebook it creates is titled with the topic `Recall` and falls under the ordinary full-match cleanup.
+
+The check never writes `state.json`, never generates audio, and is deterministic except for the Deep Research step, which only ever produces a list for a human to judge.
+
+## Known weaknesses (and where they lead)
+
+Being honest about these is part of the design; each one points at a future improvement rather than hiding behind one.
+
+| Weakness | Mitigation today | Where it leads |
+|---|---|---|
+| Credentials expire ~every 3.5 weeks, by hand | Error notification names the cause + runbook | A scheduled read-only canary probe that warns *before* the morning episode dies |
+| Whole pipeline rests on an unofficial API | Honest disclaimer; version pinned, with updates proposed weekly and checked against the CLI ([OPERATIONS.md](OPERATIONS.md#following-notebooklm-py-upstream)) | A pluggable backend (official LLM + TTS APIs) — the day that exists, the adapter seam above gets built |
+| Audio quality and hallucination risk are NotebookLM's | Summary-only sources carry explicit disclaimers | Better prompts; a prompt collection is a natural first contribution |
+| `--no-wait` means a failed render is invisible | Notification honestly says "generation started" | Next-run verification of the previous episode's artifact |

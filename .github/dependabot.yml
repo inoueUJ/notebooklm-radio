@@ -1,0 +1,30 @@
+# Keeps notebooklm-py (requirements-notebooklm.txt), the batch's Python packages and the
+# GitHub Actions current. notebooklm-py talks to an unofficial, changing Google API: staying on
+# an old pin is how the batch broke on 2026-10-02 while upstream had already shipped fixes.
+# Each update arrives as a PR; ci.yml runs the tests and the CLI contract check on it, and a
+# human merges it (the pin is not bumped automatically, since this code runs with the session cookie).
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Asia/Tokyo
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      # pytest/ruff updates in one PR; notebooklm-py and the batch's packages stay separate
+      dev-tools:
+        patterns: ['pytest*', 'ruff']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Asia/Tokyo
+    commit-message:
+      prefix: 'chore(deps)'

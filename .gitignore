@@ -1,0 +1,6 @@
+storage_state.json
+.env
+__pycache__/
+*.pyc
+.DS_Store
+CLAUDE.md
