@@ -1284,12 +1284,27 @@ def is_unread(entry_id, ts, threshold, recent_ids):
     return ts >= threshold
 
 
+def handled_links(state):
+    """直近の実行記録（_runs）で、流した・見送った・取り込めなかったのどれかに決まった記事の URL。"""
+    runs = state.get(RUNS_KEY)
+    runs = runs if isinstance(runs, list) else []
+    return {
+        link
+        for run in runs
+        if isinstance(run, dict)
+        for kind in ('aired', 'skipped', 'blocked')
+        for link in run.get(kind) or []
+    }
+
+
 def check_rss_feeds(config, state, now=None):
     """(candidates, feed_results, warnings) を返す。state はまだ変更しない。"""
     now = now or datetime.datetime.now(UTC)
     candidates = []
     feed_results = []
     warnings = []
+    # ID だけを付け直された記事を見分けるための、直近の実行で扱い済みの URL（下の repeats）
+    handled = handled_links(state)
 
     for feed_cfg in config.get('feeds', []):
         name = feed_cfg.get('name')
@@ -1397,6 +1412,28 @@ def check_rss_feeds(config, state, now=None):
         unread.sort(key=lambda e: e['ts'] or EPOCH)
         latest_mode = feed_cfg.get('mode') == 'latest' and not is_sitemap
         result['latest'] = latest_mode
+
+        # ID を付け直されただけの記事（2026-10-09 Claude Code Changelog: 既存の版の GUID と一部の日付が
+        # 変わり、放送済みの 2.1.292・2.1.293 と見送った 2.1.287 を新着として流し、放送済みの 4 版を
+        # 見送り通知に載せた）。URL が直近の実行記録で流した・見送った・取り込めなかったのどれかなら、
+        # ID が新しくても読み終えた記事として扱う（新しい ID は advance_state が記録する）。
+        # 同じ URL を複数の記事が持つフィードでは URL が記事を区別しないので、その URL には使わない。
+        if not is_sitemap and not first_run and handled:
+            link_counts = Counter(e['link'] for e in entries)
+            is_repeat = [link_counts[e['link']] == 1 and e['link'] in handled for e in unread]
+            repeats = [e for e, repeat in zip(unread, is_repeat, strict=True) if repeat]
+            if repeats:
+                unread = [e for e, repeat in zip(unread, is_repeat, strict=True) if not repeat]
+                result['repeats'] = repeats
+                warnings.append(
+                    (
+                        name,
+                        f'{len(repeats)} 件の記事が新しい ID で現れたが、URL は流した（または見送った）記事なので'
+                        'もう一度は流さずに既読にした',
+                    )
+                )
+                for e in repeats:
+                    print(f"[{name}] Re-issued ID for an article already handled: {e['link']}")
 
         # 鮮度の足切り（settings.max_age_hours）: 公開から時間が経ちすぎた記事は流さない。朝に最新情報を
         # 聞くためのラジオで、障害明けの溜まった記事や前日付で遅れて現れた記事を何日も後に流しても意味がない。
@@ -1569,8 +1606,9 @@ def advance_state(state, feed_results, processed, now=None):
         if mark_all:
             dated = [e['ts'] for e in entries if e['ts']]
         else:
-            # 鮮度の足切りで見送った記事も「読み終えた」扱いにする（次回また見送り通知を出さない）
-            consumed = picked + [e for e in result.get('skipped', []) if e not in picked]
+            # 鮮度の足切りで見送った記事と、ID だけ付け直された扱い済みの記事（repeats）も「読み終えた」扱いに
+            # する（次回また見送り通知を出さない・同じ記事を流さない）
+            consumed = picked + [e for e in [*result.get('skipped', []), *result.get('repeats', [])] if e not in picked]
             if not consumed:
                 continue  # このフィードからは何も処理していない → 変更なし
             # 日付なしの記事しか処理しなかった場合も、既読(recent_ids)の記録は必要。

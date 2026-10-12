@@ -61,6 +61,27 @@ def test_reconcile_classifies_each_article():
     assert recon['duplicates'] == ['news.example.com/1']
 
 
+def test_reconcile_counts_changelog_versions_on_one_page_separately():
+    """2026-10-11 の点検: changelog は同じページの # 位置で版を分ける。別の版を流しただけで「二度流した」と
+    数えず（Codex と Platform リリースノートが誤って載った）、同じ版を二度流したときだけ数える。
+    流していない版もページ単位では隠れない。取りこぼし検査との照合はページ単位のまま。"""
+    page = 'https://code.example.com/changelog'
+    runs = [
+        {'at': (NOW - 3 * DAY).isoformat(), 'aired': [f'{page}#1-0-1']},
+        {'at': (NOW - 2 * DAY).isoformat(), 'aired': [f'{page}#1-0-2']},
+        {'at': (NOW - DAY).isoformat(), 'aired': [f'{page}#1-0-2', 'https://news.example.com/x']},
+    ]
+    lost = entry(3, NOW - 2 * DAY, link=f'{page}#1-0-3')  # 既読なのに流していない版
+
+    recon = wc.reconcile(runs, [rss_result([lost], recent_ids=['id-3'])], NOW)
+
+    assert recon['duplicates'] == ['code.example.com/changelog#1-0-2']
+    assert len(recon['aired_links']) == 3
+    assert 'code.example.com/changelog' in recon['aired']
+    assert [e['title'] for e in recon['missed']] == ['記事3']
+    assert '流した 3 本' in wc.build_message('p', 20, [], [], recon, None, is_discord=False)
+
+
 def test_reconcile_ignores_new_feeds_blocked_articles_and_sitemaps():
     lost = entry(1, NOW - 2 * DAY)
     blocked = entry(2, NOW - 2 * DAY)
@@ -150,7 +171,15 @@ def test_build_query_default_and_custom():
 
 
 def empty_recon():
-    return {'aired': {'a', 'b'}, 'skipped': 0, 'duplicates': [], 'missed': [], 'pending': [], 'no_history': False}
+    return {
+        'aired': {'a', 'b'},
+        'aired_links': {'a#1', 'b'},
+        'skipped': 0,
+        'duplicates': [],
+        'missed': [],
+        'pending': [],
+        'no_history': False,
+    }
 
 
 def test_message_is_short_when_all_is_well():

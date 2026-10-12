@@ -53,6 +53,17 @@ def norm(url):
     return f"{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
 
 
+def link_key(url):
+    """記事単位の照合キー。norm と違い # 以降とクエリを残す（changelog は同じページの # 位置で版を分ける）。"""
+    parsed = urlparse(url)
+    key = f"{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+    if parsed.query:
+        key += f"?{parsed.query}"
+    if parsed.fragment:
+        key += f"#{parsed.fragment}"
+    return key
+
+
 def site_of(url):
     """サイトの単位（blog.cloudflare.com と developers.cloudflare.com を同じ cloudflare.com とみなす）。"""
     host = urlparse(url).netloc.lower().split(':')[0]
@@ -76,11 +87,22 @@ def reconcile(runs, results, now):
     """
     # 記録がある期間だけを見る。記録を取り始める前に流した記事を「流していない」と数えないため
     if not runs:
-        return {'aired': set(), 'skipped': 0, 'duplicates': [], 'missed': [], 'pending': [], 'no_history': True}
+        return {
+            'aired': set(),
+            'aired_links': set(),
+            'skipped': 0,
+            'duplicates': [],
+            'missed': [],
+            'pending': [],
+            'no_history': True,
+        }
     start = max(now - WINDOW, min(datetime.datetime.fromisoformat(r['at']) for r in runs))
-    aired_per_run = [{norm(u) for u in r.get('aired', [])} for r in runs]
-    aired = set().union(*aired_per_run)
-    accounted = aired | {norm(u) for r in runs for u in [*r.get('skipped', []), *r.get('blocked', [])]}
+    # 流した・二度流した・流していないは記事単位（link_key）で数える。changelog は同じページの # 位置で
+    # 版を分けるので、# を落とす norm で比べると別の版を流しただけで「二度流した」になり（2026-10-11 の点検で
+    # Codex と Platform リリースノート）、1 本でも流したページの残りの版は「流していない」に数えられなかった
+    aired_per_run = [{link_key(u) for u in r.get('aired', [])} for r in runs]
+    aired_links = set().union(*aired_per_run)
+    accounted = aired_links | {link_key(u) for r in runs for u in [*r.get('skipped', []), *r.get('blocked', [])]}
     first_run_feeds = {name for r in runs for name in r.get('first_run', [])}
     twice = Counter(u for links in aired_per_run for u in links)
 
@@ -93,14 +115,16 @@ def reconcile(runs, results, now):
         for e in result['entries']:
             if e['ts'] is None or not (start <= e['ts'] <= now - SETTLE):
                 continue
-            if norm(e['link']) in accounted:
+            if link_key(e['link']) in accounted:
                 continue
             if rb.is_unread(e['id'], e['ts'], threshold, recent):
                 pending.append(e)
             else:
                 missed.append(e)
     return {
-        'aired': aired,
+        # 取りこぼし検査（Deep Research が返す URL には # が無い）と照らすのはページ単位
+        'aired': {norm(u) for r in runs for u in r.get('aired', [])},
+        'aired_links': aired_links,
         'skipped': sum(len(r.get('skipped', [])) for r in runs),
         'duplicates': sorted(u for u, n in twice.items() if n >= 2),
         'missed': missed,
@@ -324,7 +348,7 @@ def build_message(period, feed_total, warnings, article_problems, recon, recall,
         return '\n'.join(lines)
     lines = [
         f"🗓 週次点検（{period}）",
-        f"流した {len(recon['aired'])} 本・鮮度で見送り {recon['skipped']} 本・二重 {len(recon['duplicates'])} 本・"
+        f"流した {len(recon['aired_links'])} 本・鮮度で見送り {recon['skipped']} 本・二重 {len(recon['duplicates'])} 本・"
         f"流していない {len(recon['missed'])} 本・待ち {len(recon['pending'])} 本／"
         f"フィード {feed_total - len({n for n, _ in warnings if n})} / {feed_total} 本が問題なし",
     ]

@@ -411,6 +411,75 @@ def test_duplicate_url_across_feeds_is_processed_once(monkeypatch):
     assert state['https://example.com/a']['watermark'] == state['https://example.com/b']['watermark']
 
 
+# --- ID だけを付け直された記事 -------------------------------------------------
+
+
+def entry_with(index, ts, entry_id, link=None):
+    """ID（と必要なら URL）を指定したエントリ。同じ記事が新しい ID で現れた状態を作る。"""
+    entry = FakeEntry(index, ts)
+    entry.id = entry_id
+    if link:
+        entry.link = link
+    return entry
+
+
+def test_reissued_id_of_an_aired_article_is_not_aired_again(feed_box):
+    """2026-10-09 Claude Code Changelog: 既存の版の GUID と日付が付け直され、放送済みの 2 版がもう一度流れた。
+    URL が実行記録にあれば、ID が新しくても流さずに既読にし、その回だけ警告で知らせる。"""
+    feed_box['feed'] = feed_of((1, BASE), (2, BASE + DAY))
+    state = {}
+    assert run_once(state, feed_box)[0] == ['記事2']  # 初回
+    rb.record_run(state, BASE + DAY, ['https://example.com/2'], [], [], [])
+
+    feed_box['feed'] = FakeFeed(
+        [FakeEntry(3, BASE + 3 * DAY), entry_with(2, BASE + 2 * DAY, 'new-guid-2'), FakeEntry(1, BASE)]
+    )
+    titles, warnings = run_once(state, feed_box)
+    assert titles == ['記事3']
+    assert [name for name, reason in warnings if '新しい ID' in reason] == ['Example']
+    assert 'new-guid-2' in state[FEED_URL]['recent_ids']
+
+    assert run_once(state, feed_box) == ([], [])  # 新しい ID も覚えたので、次の回は静か
+
+
+def test_reissued_id_of_a_skipped_article_is_neither_aired_nor_reported_again(feed_box, monkeypatch):
+    """2026-10-09: 10/5 に鮮度で見送った 2.1.287 が新しい ID と日付で現れ、1 週間遅れで流れた。
+    同じ回に、放送済みの 4 版が新しい ID のせいで見送り通知に載った。"""
+    monkeypatch.setattr(rb, 'MAX_AGE_HOURS', 72)
+    feed_box['feed'] = feed_of((1, BASE))
+    state = {}
+    first, results, _ = rb.check_rss_feeds(CONFIG, state, now=BASE + DAY)
+    rb.advance_state(state, results, rb.select_articles(first), now=BASE + DAY)
+
+    now = BASE + 10 * DAY
+    feed_box['feed'] = feed_of((1, BASE), (2, now - 4 * DAY))
+    _candidates, results, _ = rb.check_rss_feeds(CONFIG, state, now=now)
+    assert [e['title'] for e in results[0]['skipped']] == ['記事2']
+    rb.advance_state(state, results, [], now=now)
+    rb.record_run(state, now, [], ['https://example.com/2'], [], [])
+
+    later = now + DAY
+    feed_box['feed'] = FakeFeed([entry_with(2, later - HOUR, 'new-guid-2'), FakeEntry(1, BASE)])
+    candidates, results, _ = rb.check_rss_feeds(CONFIG, state, now=later)
+    assert candidates == []
+    assert not results[0].get('skipped')  # 見送り通知にも載せない
+    assert [e['id'] for e in results[0]['repeats']] == ['new-guid-2']
+
+
+def test_a_url_shared_by_several_entries_does_not_hide_new_ones(feed_box):
+    """記事ごとの URL を持たないフィード（どの項目も同じページを指す）では、URL で既読にしない。"""
+    page = 'https://example.com/changelog'
+    feed_box['feed'] = FakeFeed(
+        [entry_with(2, BASE + DAY, 'post-00002', page), entry_with(1, BASE, 'post-00001', page)]
+    )
+    state = {}
+    assert run_once(state, feed_box)[0] == ['記事2']
+    rb.record_run(state, BASE + DAY, [page], [], [], [])
+
+    feed_box['feed'].entries.insert(0, entry_with(3, BASE + 2 * DAY, 'post-00003', page))
+    assert run_once(state, feed_box)[0] == ['記事3']
+
+
 # --- 公開時刻を持たないエントリ ----------------------------------------------
 
 
