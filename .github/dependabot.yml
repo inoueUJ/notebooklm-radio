@@ -1,8 +1,8 @@
-# Keeps notebooklm-py (requirements-notebooklm.txt), the batch's Python packages and the
-# GitHub Actions current. notebooklm-py talks to an unofficial, changing Google API: staying on
-# an old pin is how the batch broke on 2026-10-02 while upstream had already shipped fixes.
-# Each update arrives as a PR; ci.yml runs the tests and the CLI contract check on it, and a
-# human merges it (the pin is not bumped automatically, since this code runs with the session cookie).
+# notebooklm-py（requirements-notebooklm.txt）、バッチの Python パッケージ、GitHub Actions を
+# 新しく保つ。notebooklm-py は非公式で変わり続ける Google の API を使っていて、2026-10-02 に
+# バッチが壊れたのは、上流がもう修正を出していたのに古い版のままだったから。
+# 更新はそれぞれ PR として届き、ci.yml がテストと CLI の契約の確認を行い、人がマージする
+# （このコードはセッションの Cookie と一緒に動くので、版を自動では上げない）。
 version: 2
 updates:
   - package-ecosystem: pip
@@ -15,7 +15,7 @@ updates:
     commit-message:
       prefix: 'chore(deps)'
     groups:
-      # pytest/ruff updates in one PR; notebooklm-py and the batch's packages stay separate
+      # pytest と ruff の更新は 1 本の PR にまとめる。notebooklm-py とバッチのパッケージは別々のまま
       dev-tools:
         patterns: ['pytest*', 'ruff']
 

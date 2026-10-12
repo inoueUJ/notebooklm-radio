@@ -3,7 +3,7 @@ target-version = "py312"
 line-length = 120
 
 [tool.ruff.format]
-# The codebase uses single quotes throughout; don't churn the diff.
+# コード全体でシングルクォートを使っているので、書き換えて差分を増やさない
 quote-style = "preserve"
 
 [tool.ruff.lint]

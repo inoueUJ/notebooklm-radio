@@ -1,16 +1,16 @@
 name: Weekly check
 
-# Once a week: feed health, a reconciliation of what was aired against what the
-# feeds published, and (with weekly_check.recall: true in config.yaml) a Deep
-# Research sweep for official announcements no feed carried. Posts one message.
-# Read-only for the repository: it never writes state.json.
+# 週に 1 回: フィードの健康状態、流したものとフィードが出したものの突き合わせ、
+# （config.yaml に weekly_check.recall: true があれば）どのフィードにも載らなかった公式発表の
+# Deep Research による検査。通知は 1 通にまとめる。
+# リポジトリには書き込まない（state.json を書き換えない）。
 on:
   schedule:
-    # Sunday 12:10 JST (times assume Asia/Tokyo, UTC+9). Not time-critical — GitHub
-    # may start it hours late — and far from the daily run, so the report is
-    # waiting on Monday morning.
+    # 日曜 12:10 JST（時刻は Asia/Tokyo、UTC+9 で考えている）。急ぐものではなく
+    # （GitHub は数時間遅れて始めることがある）、毎日の実行から離してあるので、
+    # 月曜の朝には報告が届いている。
     - cron: '10 3 * * 0'
-  workflow_dispatch:       # manual runs
+  workflow_dispatch:       # 手動実行
 
 permissions:
   contents: read
@@ -22,40 +22,40 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # Deep Research takes 15–30 minutes; everything else takes about one.
+    # Deep Research は 15〜30 分かかる。ほかはおよそ 1 分。
     timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
+      - name: リポジトリを取得する
         uses: actions/checkout@v7
         with:
-          # Same reason as the batch: notebooklm-py runs in this process tree.
+          # バッチと同じ理由: notebooklm-py が同じプロセスツリーで動く。
           persist-credentials: false
 
-      - name: Set up Python
+      - name: Python を用意する
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Python の依存関係を入れる
         run: pip install -r requirements.txt
 
-      - name: Install uv
+      - name: uv を入れる
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
 
-      - name: Install notebooklm-py
+      - name: notebooklm-py を入れる
         run: |
-          # Only $HOME/.local/bin goes on PATH (see the batch workflow).
+          # PATH に足すのは $HOME/.local/bin だけ（バッチのワークフローを参照）。
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           uv tool install "$(grep -E '^notebooklm-py' requirements-notebooklm.txt)"
 
-      - name: Verify environment
+      - name: 環境を確かめる
         run: |
-          python -c "import feedparser, yaml, httpx; print('pip deps OK')"
+          python -c "import feedparser, yaml, httpx; print('pip の依存関係 OK')"
           command -v notebooklm
 
-      - name: Weekly check
+      - name: 週次点検
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
           NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}

@@ -1,125 +1,128 @@
-# Design notes
+# 設計メモ
 
-This document records the load-bearing design decisions and the incidents that forced them. If you change behavior in `radio_batch.py`, read the relevant section first — most of the non-obvious code exists because the obvious version failed in production.
+この文書には、動作を支えている設計判断と、その判断のきっかけになった出来事を残しています。`radio_batch.py` の動作を変えるときは、先に関係する節を読んでください。分かりにくいコードの多くは、分かりやすい書き方が本番で失敗したから存在しています。
 
-## Architecture at a glance
+## 全体像
 
-A single ~1,100-line Python module, run twice daily by GitHub Actions cron. No server, no database. Persistent state is one JSON file (`state.json`) committed back to the repository by the bot after every run. NotebookLM is driven by shelling out to the [notebooklm-py](https://github.com/teng-lin/notebooklm-py) CLI; credentials are inherited via the environment and never read by this code.
+約 1,900 行の Python モジュール 1 つを、GitHub Actions の cron が 1 日 2 回実行します。サーバーもデータベースもありません。残しておく状態は JSON ファイル 1 つ（`state.json`）だけで、毎回の実行後に bot がリポジトリへコミットします。NotebookLM は [notebooklm-py](https://github.com/teng-lin/notebooklm-py) の CLI を呼び出して操作します。認証情報は環境変数で CLI に渡り、このコードが読むことはありません。
 
-Per run: poll feeds → decide what's new → one notebook per topic per day → add articles as sources → wait for ingestion → remove junk sources → trigger the Audio Overview (fire-and-forget) → notify → advance read-state → maintenance (cleanup, stale-feed report).
+1 回の実行の流れ: フィードを取得する → 新着を決める → トピックごとに 1 日 1 冊のノートブックを用意する → 記事をソースとして追加する → 取り込みを待つ → 中身のないソースを除く → Audio Overview の生成を開始する（完了は待たない）→ 通知する → 既読を進める → メンテナンス（古いノートブックの削除、止まったフィードの報告）。
 
-## Read-state: two mechanisms, deliberately different
+## 既読の管理: わざと違う 2 つの仕組み
 
-This is the heart of the project. There are two kinds of feeds and each gets a different read-state mechanism. **They must not be swapped** — each one is provably wrong for the other feed type.
+ここがこのプロジェクトの中心です。フィードは 2 種類あり、それぞれ別の仕組みで既読を管理します。**入れ替えてはいけません。** どちらの仕組みも、もう一方の種類のフィードでは確実に間違えます。
 
-### RSS feeds use a watermark
+### RSS フィードは透かし（watermark）を使う
 
 ```json
 { "https://vercel.com/blog/feed": { "watermark": "2026-07-09T00:00:00+00:00", "recent_ids": ["..."] } }
 ```
 
-The watermark is the publish time of the newest article ever processed. On its own it would say "an entry is unread iff its timestamp is newer", and that is almost what the code does — with two corrections that real feeds forced (below).
+透かしは、これまでに処理した中で最も新しい記事の公開時刻です。これだけなら「公開時刻が透かしより新しければ未読」というルールになり、コードもほぼその通りに動きます。ただし、実際のフィードに合わせて 3 つの補正を加えています（後述）。
 
-**Why not a seen-ID list?** Because an ID list cannot be simultaneously *bounded* and *correct* for RSS. Vercel's feed returns 1,325 entries; any list you trim will "forget" old entries, and a forgotten entry that is still in the feed comes back as unread — forever. This is not hypothetical: the original ID-list implementation produced **1,226 falsely-new articles in one run**, followed by a permanent two-run oscillation as trimmed halves of the feed took turns looking new. A timestamp is monotonic; it doesn't care how many entries the feed returns or how many IDs you throw away.
+**なぜ既読 ID の一覧ではないのか。** RSS では、ID の一覧に上限を付けたまま正しく保つことができないからです。Vercel のフィードは 1,325 件を返します。一覧を上限で切ると古い記事を「忘れ」、まだフィードに載っている忘れた記事は、いつまでも未読として戻ってきます。これは仮定の話ではありません。最初の ID 一覧の実装は **1 回の実行で 1,226 件の偽の新着** を出し、その後は切り捨てられた半分ずつが交互に新着に見える状態が、2 回周期で続きました。時刻は増える一方なので、フィードが何件返しても、ID をいくつ捨てても影響を受けません。
 
-**Correction 1 — a lookback window.** Feeds are not published in timestamp order. Items appear hours or days *after* newer items, carrying their earlier date: on 2026-09-23 OpenAI published a 13:00 post, the batch processed it, and then seven posts dated 01:00–12:00 appeared; Cloudflare's changelog regularly back-fills entries two days late. Under a pure watermark each of these is "older than the watermark" the moment it appears, so it is read without ever being processed — 37 articles in September. So an entry is unread iff it is not in `recent_ids` **and** its timestamp is at least `watermark − LOOKBACK` (7 days; the worst observed delay was just over 2 days). Anything older than that stays read no matter what, so the sliding-window problem above cannot come back: the window is bounded by time, not by a list.
+**補正 1 — 振り返りの期間。** フィードは公開時刻の順に記事を出すとは限りません。新しい記事の数時間後や数日後に、それより前の日付の記事が現れます。2026-09-23 には、OpenAI が 13:00 の記事を出してバッチがそれを処理した後に、01:00〜12:00 の日付の記事が 7 本現れました。Cloudflare の changelog は、2 日遅れで項目を足すことがよくあります。透かしだけで判定すると、こうした記事は現れた時点で「透かしより古い」ので、一度も処理されないまま既読になります。9 月には 37 本がこうして消えました。そこで、記事が未読になるのは「`recent_ids` に無く、**かつ** 公開時刻が `透かし − LOOKBACK`（7 日。観測した最大の遅れは 2 日強）以降」のときとしています。それより古いものはどんな場合も既読なので、上の切り捨ての問題は戻ってきません。期間を区切っているのは一覧ではなく時間だからです。
 
-**Correction 2 — every processed ID is remembered.** Publishers move timestamps *forward* too. Vercel re-dates edited posts (its Atom feed has only `<updated>`), and a post aired on 09-26 was aired again on 09-29; rolling posts such as Cloudflare's "scheduled WAF changes" and Google Cloud's "What's new" get a new date every week. Anything re-dated past the watermark looks new. So `recent_ids` records **every processed article**, and an ID found there is read regardless of its timestamp. The list stays bounded (`MAX_RECENT_IDS`), but IDs of entries currently inside the lookback window — and of dateless entries — are never trimmed, because the list is their only read-marker; a rolling post keeps its ID for as long as it keeps getting re-dated.
+**補正 2 — 処理した ID はすべて覚える。** 公開時刻が *後ろに* 動くこともあります。Vercel は編集した記事の日付を付け直し（Atom フィードには `<updated>` しかありません）、09-26 に流した記事を 09-29 にもう一度流しました。Cloudflare の「scheduled WAF changes」や Google Cloud の「What's new」のような更新型の記事は、毎週新しい日付になります。透かしより後ろに日付が動いたものは、どれも新着に見えます。そこで `recent_ids` には **処理したすべての記事** を記録し、ここにある ID は公開時刻にかかわらず既読とします。一覧には上限（`MAX_RECENT_IDS`）がありますが、振り返りの期間内の記事と日付のない記事の ID は切り捨てません。その記事にとって、既読の印はこの一覧しかないからです。更新型の記事は、日付が付け直され続ける限り、ID も残り続けます。
 
-What the list must never contain is an *unprocessed* article: an entry inside the window that is not in `recent_ids` is unread, which is what lets carried-over and late articles through. (The same rule fixed the 2026-09-22 incident: Cloudflare published 7 changelog entries on one date-only day, the per-feed limit took 3, and the old code, which treated `ts == watermark` as read and recorded every entry at that time, lost the other 4.)
+一覧に決して入れてはいけないのは、*処理していない* 記事です。期間内にあって `recent_ids` に無い記事は未読になり、それによって持ち越した記事や遅れて現れた記事が拾われます。（2026-09-22 の出来事も、同じルールで直りました。Cloudflare が日付だけのフィードで 1 日に 7 本の changelog を出し、フィードごとの上限で 3 本を処理したところ、`ts == 透かし` を既読とみなしてその時刻の記事をすべて記録していた古いコードが、残りの 4 本を失いました。）
 
-**The floor.** The window never reaches back before `floor`, the watermark at which a feed started being tracked this way. State written before the lookback existed only recorded same-timestamp IDs, so looking back past its watermark would re-air a week of already-processed articles; for such state `floor` is taken to be its current watermark. A feed's first run sets `floor` to its first watermark (everything older was marked read on purpose).
+**補正 3 — ID を付け直された記事は URL で見分ける。** 既存の記事に新しい GUID を付け直すフィードがあります。2026-10-09、Claude Code の changelog は複数の版の GUID を付け直し、そのうち 2 つは日付も動かしました。バッチは 2.1.292 と 2.1.293 をもう一度流し、鮮度で見送っていた 2.1.287 を 1 週間遅れで流しました。さらに、放送済みの 4 つの版を見送り通知に載せました。そこで、実行記録（`state['_runs']`）に「流した・見送った・取り込めなかった」と記録されている URL を持つ未読の記事は、扱い済みとします。流さず、見送り通知にも載せず、新しい ID を記録します。付け直しが起きたことは、その回のフィードの警告で 1 回だけ知らせます。同じフィードの複数の記事が共有している URL は記事を区別しないので、この判定には使いません。覚えているのは直近 `MAX_RUN_HISTORY` 回分です。
 
-**The watermark stops at "now".** A single future-dated entry (a typo'd year, a timezone slip) would otherwise push the watermark into the future and silently mark everything up to that date as read. The processed ID keeps the future-dated entry itself from being aired twice.
+**下限（floor）。** 振り返りの期間は `floor` より前には広げません。`floor` は、そのフィードをこの方式で追い始めたときの透かしです。振り返りを入れる前に書かれた state は、同じ時刻の ID しか記録していないので、その透かしより前を振り返ると、処理済みの記事を 1 週間分流し直してしまいます。そうした state では、今の透かしを `floor` とみなします。フィードの初回の実行では、最初の透かしを `floor` にします（それより古い記事は、意図して既読にしたものです）。
 
-**Two feeds that publish the same URL** (Vercel's `blog/feed` and `atom` are identical) are deduplicated by URL before selection; the article is added once, and read-state advances in both feeds because `advance_state` matches processed articles by URL as well as by ID (GUIDs differ per feed).
+**透かしは「今」で止める。** 未来の日付の記事が 1 本でもあると（年の打ち間違いやタイムゾーンのずれ）、透かしが未来に飛び、その日付までのすべての記事が黙って既読になります。未来の日付の記事そのものが二度流れないのは、処理済みの ID が記録されているからです。
 
-### Sitemap feeds use a seen-URL set
+**同じ URL を配信する 2 つのフィード**（Vercel の `blog/feed` と `atom` は中身が同じ）は、選ぶ前に URL で重複を除きます。記事は 1 回だけ追加されます。`advance_state` が ID だけでなく URL でも処理済みの記事を照らし合わせるので、両方のフィードの既読が進みます（GUID はフィードごとに違います）。
+
+### サイトマップは既読 URL の集合を使う
 
 ```json
 { "sitemap:https://www.anthropic.com/sitemap.xml:https://www.anthropic.com/news/": { "seen": ["..."] } }
 ```
 
-**Why not a watermark?** Sitemap `<lastmod>` is a *last-modified* date, not a publish date. Editing an old article bumps it past any watermark, and the article resurfaces as "new". This happened on 2026-07-13: an April article reappeared in the radio because someone touched it in July. So `lastmod` is never used for newness.
+**なぜ透かしではないのか。** サイトマップの `<lastmod>` は公開日ではなく *最終更新日* です。古い記事を編集するとどの透かしよりも新しくなり、その記事が「新着」として戻ってきます。2026-07-13 に実際に起き、7 月に誰かが手を入れた 4 月の記事がラジオに流れました。そのため、`lastmod` は新着の判定に一切使いません。
 
-A seen-set is correct *and* bounded here because a sitemap returns its full URL set every run: membership checks are exact, and the set is intersected with the current sitemap so it can never outgrow it. The sliding-window problem that rules out ID lists for RSS structurally cannot occur.
+サイトマップは毎回すべての URL を返すので、ここでは既読の集合が正しく、しかも上限のあるものになります。集合に含まれるかどうかの判定は正確で、集合は今のサイトマップとの共通部分に絞られるので、サイトマップより大きくなりません。RSS で ID の一覧を使えなくしている切り捨ての問題は、構造上起こりません。
 
-**The state key includes the URL prefix**, not just the sitemap URL. Two configured feeds can share one physical sitemap (e.g. `/news/` and `/engineering/` on the same domain); when they shared a state key, one feed's articles were silently marked read by the other. That silent loss is why the key is `sitemap:{url}:{prefix}`.
+**state のキーには、サイトマップの URL だけでなく URL のプレフィックスも含めます。** 設定した 2 つのフィードが、1 つのサイトマップを共有することがあります（同じドメインの `/news/` と `/engineering/` など）。キーを共有していたときは、一方のフィードの記事が、もう一方によって黙って既読にされていました。キーが `sitemap:{url}:{prefix}` なのは、この取りこぼしを防ぐためです。
 
-**URLs are compared without a trailing slash, and a mass change is treated as a re-shuffle, not news.** On 2026-09-29 antigravity.google started listing every blog URL with a trailing `/`; none matched the seen-set, all 24 posts looked new, and an old post aired. Seen-set membership now ignores a trailing slash, and if more than half of a sitemap's URLs (and at least five) turn unread at once, the run marks the current URLs as seen, airs nothing, and says so in the feed-warning notification — a site that changes its URL scheme (a slash, a locale path) must not re-air its archive.
+**URL は末尾の / を無視して比べ、一斉の変化はニュースではなく並べ替えとして扱います。** 2026-09-29、antigravity.google がブログの全 URL を末尾 `/` 付きで載せ始めました。既読の集合とどれも一致せず、24 本すべてが新着に見え、古い記事が 1 本流れました。今は集合の照合で末尾の / を無視します。さらに、サイトマップの URL の半分以上（かつ 5 本以上）が一度に未読になったときは、今の URL を既読にして何も流さず、そのことをフィードの警告で知らせます。URL の形（末尾の /、言語のパス）を変えたサイトで、過去の記事を流し直してはいけないからです。
 
-### Invariants that follow
+### ここから導かれる不変条件
 
-- **Never mark an article read that wasn't processed.** Articles beyond the per-run limits stay unread and are drained oldest-first on later runs.
-- **Read-state advances and saves even when there are no new articles** — a feed's first-run initialization must persist. Do not add an early return that skips it.
-- **A feed that fails to fetch must not initialize its state.** Otherwise a temporary 404 marks the entire backlog as read.
-- **An entry inside the lookback window that is not in `recent_ids` is unread.** `recent_ids` must therefore hold processed entries only — never unprocessed ones — and must not drop the IDs of entries that are still inside the window.
-- **Within the per-run total, articles closest to scrolling out of their feed go first.** A feed only shows its newest N items; an article that is not processed before N newer ones appear is gone. Ordering the total cap purely oldest-first let feeds with an old backlog take every slot after the 2026-08 outage, while GitHub Changelog (10 items, about a day) got no slot for 30 runs and lost 101 of 152 posts. The cap is now filled by "headroom" (how many new posts until the article drops out), then age; inside one feed the oldest article always has the least headroom, so each feed still drains oldest-first. Sitemaps never scroll out and go last.
-- **An article whose sources were added but whose audio could not be started is still marked read.** The sources are already in the notebook; leaving the article unread would only re-add the same URLs next run. The failure is reported separately, with the CLI's error code (e.g. `rate_limited` when the daily Audio Overview quota is hit).
-- First run per RSS feed processes only the newest article and marks the rest read — no backlog flood on day one. **A sitemap's first run processes nothing**: `lastmod` is an edit date, so "the newest page" cannot be known, and picking by `lastmod` aired an April digest and a recruiting page when new sitemap feeds were added. New URLs are aired from the second run on. **An RSS feed's first pick is also skipped when another feed on the same host has already processed up to that time** — replacing a firehose with a narrower feed from the same site (a label or category feed) would otherwise re-air an article the old feed aired days ago; four such re-airs were due on 2026-09-29.
-- **`settings.max_age_hours` is the second deliberate exception**, opt-in for the whole deployment. A morning news show gains nothing from airing a two-week-old announcement: after the 2026-08 credential outage the author's radio aired articles a median of 14.5 days after publication for two weeks. With the setting, a dated RSS entry older than the limit is marked read instead of processed, and every skipped article is listed in one notification — skipped, never silently lost. Sitemap URLs and undated entries are never judged stale (a sitemap's dates are edit dates), and a feed's first run doesn't count as skipping.
-- **`mode: latest` is the other deliberate exception** to "never mark unread articles read", and it is opt-in per feed. An aggregator that publishes hundreds of items a month cannot be drained oldest-first at three per run without airing week-old items forever; for such feeds the user chooses "the newest N each run, the rest is read". A run that processes nothing from such a feed (its topic failed) advances nothing, so the next run picks the newest again. Sitemaps ignore it — a seen-set looks at the full URL set every run, so there is no backlog to skip.
+- **処理していない記事を既読にしない。** 1 回の上限を超えた記事は未読のまま残り、次回以降に古い順で処理されます。
+- **新着がなくても、既読を進めて保存する。** フィードの初回の初期化を残すためです。それを飛ばす早期 return を足さないでください。
+- **取得に失敗したフィードの state を初期化しない。** さもないと、一時的な 404 で過去の記事がすべて既読になります。
+- **振り返りの期間内にあって `recent_ids` に無い記事は未読。** したがって `recent_ids` には処理した記事だけを入れ（処理していない記事は決して入れない）、期間内の記事の ID を切り捨ててはいけません。
+- **実行記録で扱い済みの URL の記事は、新しい ID で現れてももう一度流さない。** ただし、そのフィードの複数の記事が同じ URL を共有している場合は除きます。
+- **1 回の全体の上限は、フィードの表示範囲から押し出されそうな記事から埋める。** フィードは新しい N 件しか表示しないので、新しい記事が N 件現れる前に処理できなかった記事は消えます。全体の上限を古い順だけで埋めていたときは、2026-08 の障害の後に、古い記事を溜めたフィードが毎回枠を使い切りました。GitHub Changelog（10 件、およそ 1 日分）は 30 回の実行で枠を 1 つも得られず、152 本中 101 本を失いました。今は「余裕」（あと何本の新着でその記事が押し出されるか）、次に古さの順で埋めます。1 つのフィードの中では最も古い記事の余裕が常に最も小さいので、フィードごとには今も古い順に処理されます。サイトマップは押し出されないので最後です。
+- **ソースは追加したが音声を開始できなかった記事も、既読にする。** ソースはもうノートブックに入っています。未読のままにすると、次の回に同じ URL をまた追加するだけです。失敗は CLI のエラーコード付きで別に知らせます（1 日の Audio Overview の上限に達したときは `rate_limited`）。
+- RSS フィードの初回は最新の 1 本だけを処理し、残りを既読にします。初日に過去の記事があふれないようにするためです。**サイトマップの初回は何も処理しません。** `lastmod` は編集日なので「最新のページ」を決められず、`lastmod` で選んでいたときは、サイトマップのフィードを足したときに 4 月のまとめ記事と募集ページを流しました。新しい URL は 2 回目から流します。**RSS フィードの初回の 1 本も、同じホストの別のフィードがその時刻までを処理済みなら飛ばします。** 流量の多いフィードを同じサイトの狭いフィード（ラベル別・カテゴリ別）に置き換えると、古いフィードが数日前に流した記事を流し直すことになるからです。2026-09-29 には、そうした流し直しが 4 本起きるところでした。
+- **`settings.max_age_hours` は 2 つ目の意図的な例外**で、デプロイ全体に対して選べる設定です。朝のニュース番組で 2 週間前の発表を流しても意味がありません。2026-08 の認証の障害の後、作者のラジオは 2 週間にわたって、公開から中央値 14.5 日後の記事を流していました。この設定があると、上限より古い日付付きの RSS の記事は処理せずに既読にし、見送った記事はすべて 1 通の通知に並べます。見送るのであって、黙って消すことはありません。サイトマップの URL と日付のない記事は古いと判定しません（サイトマップの日付は編集日です）。フィードの初回は見送りに数えません。
+- **`mode: latest` はもう 1 つの意図的な例外**で、「未読の記事を既読にしない」に対して、フィードごとに選べる例外です。月に数百本を出すアグリゲータを 1 回 3 本ずつ古い順に処理すると、1 週間前の記事を永遠に流し続けることになります。そうしたフィードでは、利用者が「毎回最新の N 本、残りは既読」を選びます。そのフィードから何も処理しなかった回（そのトピックが失敗した回）は何も進めないので、次の回にまた最新を拾います。サイトマップでは無視されます。既読の集合は毎回すべての URL を見るので、飛ばすべき過去の記事がないからです。
 
-## Topic split
+## トピックの分割
 
-Each feed maps to a `topic`, and each topic gets its own daily notebook and its own audio generation. Mixing AI news and infrastructure changelogs in one conversation produced incoherent radio. Topics fail independently: one topic's error doesn't stop the other's episode, read-state advances only for articles whose topic succeeded, and the run exits non-zero at the end if anything failed.
+フィードはそれぞれ 1 つの `topic` に属し、トピックごとに 1 日 1 冊のノートブックと、別々の音声の生成があります。AI のニュースとインフラの changelog を 1 つの会話に混ぜると、ラジオの内容がまとまりませんでした。トピックは別々に失敗します。一方のトピックのエラーでもう一方の回は止まらず、既読は成功したトピックの記事の分だけ進み、何かが失敗していれば最後に 0 以外の終了コードで終わります。
 
-**Per-topic audio.** `topics.<name>.audio` overrides `settings.audio` for one topic (`format`, `length`, `prompt`, `language`), resolved by `audio_settings_for`. A changelog topic can be a short *brief* while the AI topic stays a long *deep-dive*. Cleanup recognizes topic names from this section as well as from `feeds[].topic`, so a topic whose feeds were removed still gets its old notebooks deleted.
+**トピックごとの音声。** `topics.<name>.audio` は、1 つのトピックについて `settings.audio` を上書きします（`format`、`length`、`prompt`、`language`）。どちらを使うかは `audio_settings_for` が決めます。changelog のトピックを短い *brief* にして、AI のトピックは長い *deep-dive* のままにできます。古いノートブックの削除は、`feeds[].topic` だけでなくこの節のトピック名も認識するので、フィードを外したトピックでも古いノートブックが消えます。
 
-**Episodes cover the run, not the day.** Two runs a day share one notebook per topic, but the second Audio Overview is generated with `-s` limited to the sources added in *that* run (`settings.audio.scope: run`, the default). Before this, the evening episode re-discussed every morning article. `scope: notebook` restores the old whole-notebook behavior.
+**1 回分の放送は、その日ではなくその回の記事を扱う。** 1 日 2 回の実行はトピックごとに 1 冊のノートブックを共有しますが、2 回目の Audio Overview は、*その回* に追加したソースだけに `-s` で絞って生成します（`settings.audio.scope: run`、既定）。以前は、夕方の回が朝の記事をすべてもう一度話していました。`scope: notebook` にすると、ノートブック全体から生成する以前の動きに戻ります。
 
-**Quota is the real limit on splitting.** NotebookLM caps Audio Overviews per day (3 on the free tier, 6 on Plus, 20 on Pro). Every topic × every run is one generation, so two topics twice a day already exceed the free tier; the fourth trigger fails with `rate_limited`, the articles stay in the notebook and are marked read, and the failure is reported. Choose the number of topics and runs with that arithmetic in mind.
+**分割を本当に制限するのは上限。** NotebookLM の Audio Overview は、1 日に作れる回数に上限があります（無料 3 回、Plus 6 回、Pro 20 回）。トピックの数 × 実行の回数がそのまま生成の回数なので、2 つのトピックを 1 日 2 回実行すると、無料の上限を超えます。4 回目の開始は `rate_limited` で失敗し、記事はノートブックに残ったまま既読になり、失敗が知らされます。トピックの数と実行の回数は、この計算を前提に決めてください。
 
-## Configuration is validated, not trusted
+## 設定は信用せず検査する
 
-`validate_config` runs before anything else, and `python radio_batch.py --check-config` runs it alone (CI does the same before every batch). Unknown keys are **errors**, not warnings: a `feed:` typo used to yield zero feeds and a cheerful "nothing new today", and a `topics:` inside a feed silently routed it to the default topic. The same rules are published as `config.schema.json` so that a config builder can only produce what the runtime accepts. This is not a dry-run mode for the batch — it reads one file and touches nothing else.
+`validate_config` は何よりも先に実行され、`python radio_batch.py --check-config` はそれだけを実行します（CI も、毎回のバッチの前に同じことをします）。未知のキーは警告ではなく **エラー** です。`feed:` の打ち間違いでフィードが 0 本になり「今日は新着なし」と明るく報告されたことや、フィードの中に書いた `topics:` が黙って既定のトピックに回されたことがあったからです。同じルールを `config.schema.json` としても公開しているので、設定ビルダーは実行時に受け付けられるものしか作れません。これはバッチのドライランではありません。ファイルを 1 つ読むだけで、ほかには何も触りません。
 
-## Cleanup: the full-match guarantee
+## 古いノートブックの削除: 完全一致による保証
 
-`cleanup_old_notebooks` deletes notebooks whose title **fully matches** `notebook_title_format` with a `YYYY-MM-DD` date, older than `retention_days`. `{topic}` expands only to topic names that actually exist in the config — never to a wildcard. This full-match rule is the *entire* safety guarantee that your manually created notebooks are untouchable. Never loosen it to substring or prefix matching. `dry_run: true` (the shipped default) posts the would-delete list instead of deleting.
+`cleanup_old_notebooks` が削除するのは、タイトルが `YYYY-MM-DD` の日付入りで `notebook_title_format` に **完全に一致** し、`retention_days` より古いノートブックだけです。`{topic}` は設定に実際にあるトピック名にだけ展開され、ワイルドカードにはなりません。手で作ったノートブックに決して触れないことを保証しているのは、この完全一致のルール *だけ* です。部分一致や前方一致に緩めないでください。`dry_run: true`（配布時の既定）のあいだは、削除する代わりに削除対象の一覧を知らせます。
 
-## Hostile fetch targets
+## 取得しにくい相手
 
-Two related problems, one honest policy.
+関係する 2 つの問題と、1 つの正直な方針です。
 
-**`source_mode: text`** exists because for some feeds the article URL never gives NotebookLM the article. There are two ways this happens:
+**`source_mode: text`** は、記事の URL を渡しても NotebookLM に記事の中身が届かないフィードのためにあります。こうなる場合は 2 つあります。
 
-- **Bot-protected hosts.** Some hosts (e.g. `openai.com` article pages) return a bot challenge (`403`, `cf-mitigated: challenge`) to every non-browser client, so NotebookLM's fetcher stores the challenge page instead of the article. Retries can never fix this — the block is on their side.
-- **Anchor-linked changelogs.** Some changelog feeds link every entry to a `#fragment` of one long page (Codex, Claude Code). NotebookLM drops the fragment and imports the entire page — every release ever published — once per entry: on 2026-09-23 one notebook held three identical copies of the Codex changelog page, and the episode was scoped to "this run's sources" in name only.
+- **ボット対策のあるホスト。** 一部のホスト（`openai.com` の記事ページなど）は、ブラウザ以外のすべてのクライアントにボット確認（`403`、`cf-mitigated: challenge`）を返します。NotebookLM の取得処理は、記事ではなく確認ページを保存してしまいます。ブロックしているのは相手側なので、再試行では直りません。
+- **# 位置にリンクする changelog。** 一部の changelog のフィードは、すべての項目を 1 つの長いページの `#fragment` にリンクしています（Codex、Claude Code）。NotebookLM は fragment を落として、これまでのすべてのリリースが載ったページ全体を、項目ごとに 1 回ずつ取り込みます。2026-09-23 には、1 冊のノートブックに Codex の changelog のページが 3 つ同じ内容で入り、「その回のソースだけ」に絞ったはずの放送が名ばかりになりました。
 
-Such feeds are submitted as text sources built from the feed item itself, which never touches the fetcher. The text **must** say what it contains. When the item carries a body — `content:encoded` or Atom `<content>`, or any text at all when its link is an `#anchor` on a single changelog page (the item's text *is* the entry; Claude Platform's release notes put each day's complete notes in `<description>`) — the source is that body, labeled as the feed's text. Length is deliberately not the test: OpenAI's summaries run up to 683 characters while a short day of release notes is under 100. When it carries only a description, the source keeps its leading disclaimer that it is a summary, not the full article: some feeds ship only a ~150-character description, and a radio that assumes it read the full article will invent facts. Notifications mark the summary-only articles.
+こうしたフィードは、フィードの項目そのものから作ったテキストのソースとして投入するので、取得処理には一切触れません。テキストには、何が入っているかを **必ず** 書きます。項目に本文がある場合は、その本文を、フィードの本文だと明記してソースにします。本文があるとみなすのは、`content:encoded` や Atom の `<content>` がある項目と、リンクが 1 ページの changelog の `#anchor` である項目です（後者はテキストそのものが項目の全文です。Claude Platform のリリースノートは、各日の全文を `<description>` に入れています）。長さでは判断しません。OpenAI の要約は最長 683 文字あり、短い日のリリースノートは 100 文字に満たないからです。説明文しかない場合は、ソースの冒頭に「これは要約で、記事の全文ではない」という注意書きを残します。説明文が約 150 文字しかないフィードもあり、全文を読んだつもりのラジオは事実をでっち上げるからです。要約しかない記事には、通知でも印を付けます。
 
-**Junk-source detection**: `source add` can "succeed" while storing a challenge page — the source becomes ready with a title like "Just a moment...". After the ingestion wait, sources whose titles match the challenge-page regex are deleted and reported as not-included. If *all* of a topic's sources were junk, audio generation is skipped (regenerating from the notebook's stale sources would be worse than silence), but the articles are still marked read — retrying would fetch the same challenge page. Text-mode sources are excluded from this check: their titles are ones we set ourselves.
+**中身のないソースの検出**: `source add` は、確認ページを保存したまま「成功」することがあります。ソースは「Just a moment...」のようなタイトルで準備完了になります。取り込みを待った後、タイトルが確認ページの正規表現に一致するソースを削除し、含められなかったものとして知らせます。トピックのソースが *すべて* そうだった場合は、音声の生成を飛ばします（ノートブックに残る古いソースから作り直すくらいなら、何も流さないほうがましです）。ただし、記事は既読にします。再試行しても、同じ確認ページを取ってくるだけだからです。テキストのソースはこの検査の対象外です。タイトルは自分たちで付けたものだからです。
 
-**The policy**: this project does **not** spoof a browser User-Agent to get past bot protection. That would be evading someone else's explicit access decision. We settle for less content instead, and we say so honestly in the output. The fetch User-Agent identifies this software and links back to its repository.
+**方針**: このプロジェクトは、ボット対策をくぐり抜けるためにブラウザの User-Agent を **偽装しません**。相手が明示的に決めたアクセスの判断を、すり抜けることになるからです。代わりに中身が少なくなることを受け入れ、そのことを出力で正直に伝えます。取得に使う User-Agent は、このソフトウェアであることを示し、リポジトリへのリンクを含みます。
 
-## Things this project deliberately does not do
+## このプロジェクトがあえてやらないこと
 
-Documented so they aren't "fixed" casually:
+気軽に「直され」ないように書いておきます。
 
-- **No backend abstraction over the notebooklm CLI (yet).** All CLI calls sit behind ~8 conceptual operations (list/create/delete notebook, add/wait/list/delete source, generate audio), so an adapter seam exists on paper. It stays unbuilt until a concrete second backend (e.g. an official API) gives it a reason to exist. Abstractions built for one implementation are speculation.
-- **Not a pip library.** notebooklm-py owns the client-library niche; this is an application template. The value is the pipeline and its operational hardening, not an importable API.
-- **No notification plugin system.** Slack and Discord are auto-detected from the webhook URL; that covers the realistic cases at near-zero complexity.
-- **No dry-run mode for the batch itself.** The script's side effects are the product. Verification is `pytest -q` (no network — the CLI boundary and feed fetching are monkeypatched); real execution happens only via `gh workflow run`. `--check-config` is not a dry run: it validates `config.yaml` and exits without touching feeds, NotebookLM or state.
-- **No User-Agent spoofing.** See above.
+- **notebooklm CLI を包む抽象化は、まだ作らない。** CLI の呼び出しはすべて、およそ 8 つの操作（ノートブックの一覧・作成・削除、ソースの追加・待機・一覧・削除、音声の生成）の後ろにあるので、差し替えの境目は設計の上では存在します。具体的な 2 つ目の実装（公式 API など）が必要になるまでは作りません。実装が 1 つしかない抽象化は、推測にすぎません。
+- **pip のライブラリにはしない。** クライアントライブラリの役割は notebooklm-py が担っていて、これはアプリケーションのテンプレートです。価値はパイプラインと、運用で鍛えた部分にあります。import できる API にはありません。
+- **通知のプラグイン機構は作らない。** Slack と Discord は webhook の URL から自動で見分けます。現実に必要な範囲は、ほとんど複雑さを足さずにそれで足ります。
+- **バッチ自体のドライランは作らない。** スクリプトの副作用こそが成果物です。検証は `pytest -q`（ネットワークなし。CLI との境目とフィードの取得は差し替えています）で行い、本当の実行は `gh workflow run` からだけ行います。`--check-config` はドライランではなく、`config.yaml` を検査して、フィードにも NotebookLM にも state にも触れずに終わります。
+- **User-Agent の偽装はしない。** 上を参照してください。
 
-## Weekly check: verification, not just monitoring
+## 週次点検: 見張るだけでなく確かめる
 
-The per-run notifications say what happened in one run. They can't say what *didn't* happen — an article that scrolled out of a feed before it was processed leaves no trace in any run. The 279 lost articles of September were only found by reconciling a month of logs against the feeds. `scripts/weekly_check.py` (its own workflow, Sunday) makes that reconciliation routine:
+毎回の通知は、その回に何が起きたかを伝えます。何が *起きなかったか* は伝えられません。処理される前にフィードから押し出された記事は、どの回にも跡を残さないからです。9 月に失われた 279 本は、1 か月分のログとフィードを突き合わせて、初めて見つかりました。`scripts/weekly_check.py`（専用のワークフロー、日曜）は、その突き合わせを毎週の決まった作業にします。
 
-- **Feed health** runs the batch's own fetch and read-state code on a *copy* of `state.json` — the same warnings the batch would raise, plus a fetch of each URL-mode feed's newest article to catch challenge pages and empty (JavaScript-only) pages before they become junk sources.
-- **Reconciliation** needs to know what was aired. Run logs expire after 90 days and need API access, so the batch keeps its last 30 runs in `state.json` under `_runs` (`aired`, `skipped`, `blocked`, `first_run`). An RSS article published in the window (older than 24 h, so the next run has had its chance) that was neither aired, skipped as stale, nor blocked, and is not still waiting as unread, is reported as **not aired** — a loss nobody has explained yet. Sitemaps are left out: their dates are edit dates.
-- **Recall** (opt-in, `weekly_check.recall`) asks NotebookLM's Deep Research for the week's official announcements and sorts what it finds: aired, present in a feed (skipped or filtered), **on a followed site but in no feed** (a subscription gap — this is how `anthropic.com/claude-opus-5-5` would have surfaced), or elsewhere. It uses the CI credential the batch already has; the notebook it creates is titled with the topic `Recall` and falls under the ordinary full-match cleanup.
+- **フィードの健康状態**: バッチと同じ取得と既読判定のコードを、`state.json` の *コピー* に対して実行します。バッチが出すのと同じ警告に加えて、URL で投入するフィードの最新記事を取得し、確認ページや（JavaScript でしか中身を出さない）空のページを、中身のないソースになる前に見つけます。
+- **突き合わせ**には、何を流したかが必要です。実行ログは 90 日で消え、取り出すにも API が要るので、バッチは直近 30 回の実行を `state.json` の `_runs` に残します（`aired`、`skipped`、`blocked`、`first_run`）。期間内に公開された RSS の記事（次の回に拾われる時間を見て、24 時間より前のもの）のうち、流してもおらず、鮮度で見送ってもおらず、取り込めなかったのでもなく、未読で待っているのでもないものを、**流していない** として報告します。まだ誰も理由を説明できていない取りこぼしです。1 ページの `#anchor` で版を分ける changelog も、版ごとに数えます。サイトマップは対象外です。日付が編集日だからです。
+- **取りこぼし検査**（任意、`weekly_check.recall`）は、NotebookLM の Deep Research にその週の公式発表を探させ、見つかったものを分けます。流したもの、フィードにあるもの（見送り・絞り込み）、**購読しているサイトにあるのにどのフィードにも無いもの**（購読の穴。`anthropic.com/claude-opus-5-5` はここに出たはずでした）、それ以外です。バッチがすでに持っている CI 用の認証情報を使います。作るノートブックはトピック `Recall` のタイトルで、通常の完全一致の削除の対象になります。
 
-The check never writes `state.json`, never generates audio, and is deterministic except for the Deep Research step, which only ever produces a list for a human to judge.
+点検は `state.json` を書き換えず、音声も作りません。Deep Research の部分を除けば結果は毎回同じで、その部分も、人が判断するための一覧を作るだけです。
 
-## Known weaknesses (and where they lead)
+## 分かっている弱点（と、その先）
 
-Being honest about these is part of the design; each one points at a future improvement rather than hiding behind one.
+これを正直に書くことも設計の一部です。どの弱点も、改善の行き先を示しています。
 
-| Weakness | Mitigation today | Where it leads |
+| 弱点 | 今の対策 | その先 |
 |---|---|---|
-| Credentials expire ~every 3.5 weeks, by hand | Error notification names the cause + runbook | A scheduled read-only canary probe that warns *before* the morning episode dies |
-| Whole pipeline rests on an unofficial API | Honest disclaimer; version pinned, with updates proposed weekly and checked against the CLI ([OPERATIONS.md](OPERATIONS.md#following-notebooklm-py-upstream)) | A pluggable backend (official LLM + TTS APIs) — the day that exists, the adapter seam above gets built |
-| Audio quality and hallucination risk are NotebookLM's | Summary-only sources carry explicit disclaimers | Better prompts; a prompt collection is a natural first contribution |
-| `--no-wait` means a failed render is invisible | Notification honestly says "generation started" | Next-run verification of the previous episode's artifact |
+| 認証情報が約 3.5 週ごとに切れ、手で更新する | エラー通知が原因と手順を示す | 朝の放送が止まる *前に* 警告する、読み取りだけの定期的な見張り |
+| パイプライン全体が非公式の API に乗っている | 正直な注意書き。版は固定し、更新を毎週提案して CLI と照らし合わせる（[OPERATIONS.md](OPERATIONS.md#notebooklm-py-の更新に追従する)） | 差し替えられる実装（公式の LLM と TTS の API）。それが現れたら、上で述べた境目を作る |
+| 音声の品質と、事実と違う内容のリスクは NotebookLM 次第 | 要約しかないソースには、明示的な注意書きを付ける | プロンプトの改善。プロンプト集は、最初の貢献に向いている |
+| `--no-wait` なので、生成の失敗が見えない | 通知は正直に「生成を開始した」と言う | 次の回で、前の回の成果物を確かめる |

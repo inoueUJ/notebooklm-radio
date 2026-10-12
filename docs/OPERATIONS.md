@@ -1,37 +1,37 @@
-# Operations
+# 運用メモ
 
-How to keep this running, what breaks, and the incidents that shaped these rules.
+動かし続ける方法、壊れるところ、そしてこれらのルールのもとになった出来事をまとめます。
 
-## The auth model (read this once, it explains everything else)
+## 認証の仕組み（一度読めば、ほかのことがすべて分かります）
 
-NotebookLM has no official API. Authentication is a set of Google session cookies captured by a real browser login (`notebooklm -p ci login`) and frozen into the `NOTEBOOKLM_AUTH_JSON` secret.
+NotebookLM には公式の API がありません。認証には、実際のブラウザでのログイン（`notebooklm -p ci login`）で取り出した Google のセッション Cookie を使い、それを固定したまま `NOTEBOOKLM_AUTH_JSON` シークレットに入れています。
 
-The crucial asymmetry: a **local** login stays alive because every CLI call rewrites `~/.notebooklm/profiles/<name>/storage_state.json` with rotated cookies. The **secret** is a frozen copy with no backing file — notebooklm-py's cookie-refresh and recovery paths explicitly decline for env-var auth (there is nowhere to write the rotated cookies back to). So the secret's session ages from the moment you capture it and eventually dies. **This cannot be fixed by retries, waiting, or code** — only by re-capturing.
+肝心なのは手元とシークレットの違いです。**手元の** ログインは、CLI を呼ぶたびに `~/.notebooklm/profiles/<name>/storage_state.json` が新しい Cookie で書き換わるので、生き続けます。**シークレット** は、書き戻す先のファイルがない固定のコピーです。notebooklm-py の Cookie の更新と回復の処理は、環境変数での認証では明示的に動きません（更新した Cookie を書き戻す場所がないからです）。そのため、シークレットのセッションは取り出した瞬間から古くなり、いずれ切れます。**再試行でも、待っても、コードでも直せません。** 取り出し直すしかありません。
 
-Measured lifetime: **~3.5 weeks** — *if* you follow the profile rule below.
+測った寿命は **約 3.5 週** です。ただし、下のプロファイルのルールを守った場合です。
 
-## Rule: the CI credential comes from a dedicated profile, never your default
+## ルール: CI 用の認証情報は専用のプロファイルから取り、default は使わない
 
-Use `notebooklm -p ci login` and export the `ci` profile. Never point the secret at `profiles/default`.
+`notebooklm -p ci login` を使い、`ci` プロファイルを書き出してください。シークレットを `profiles/default` に向けてはいけません。
 
-Why: the two profiles are separate Google sessions (verified: `SID` / `__Secure-1PSID` / `__Secure-1PSIDTS` / `SAPISID` all differ) on the same account. If the secret shares your everyday session, every local `notebooklm` call rotates the cookies and invalidates the frozen copy — measured lifetime drops from ~3.5 weeks to **~3 days**. Keep `default` as your active local profile so ordinary use never touches the CI session.
+理由: 2 つのプロファイルは、同じアカウントの別々の Google セッションです（確認済み: `SID` / `__Secure-1PSID` / `__Secure-1PSIDTS` / `SAPISID` がすべて違う）。シークレットが普段使いのセッションを共有していると、手元で `notebooklm` を呼ぶたびに Cookie が更新されて固定のコピーが無効になり、寿命が約 3.5 週から **約 3 日** に縮みます。手元で使うプロファイルは `default` のままにして、普段の利用が CI のセッションに触れないようにしてください。
 
-## Renewal runbook (~3 minutes plus the run)
+## 更新の手順（約 3 分と、実行を待つ時間）
 
-When auth expires (or the error notification says so):
+認証が切れたら（またはエラー通知がそう言ったら）:
 
 ```bash
 python3 scripts/setup.py renew
 ```
 
-It does four things in order and stops at the first one that fails:
+次の 4 つを順に行い、失敗したところで止まります。
 
-1. Matches the local notebooklm CLI to `requirements-notebooklm.txt`. The login runs on your machine, so an older local CLI repeats login bugs that CI's version no longer has.
-2. Deletes the previous `storage_state.json` and runs `notebooklm -p ci login --fresh` (`--fresh` clears the profile's browser session but keeps that file, hence the separate delete). Then it checks the new credential with `notebooklm -p ci auth check --test --passive`, a read-only probe that never rotates cookies or rewrites the file. If the check fails, nothing is uploaded.
-3. Streams the file into the `NOTEBOOKLM_AUTH_JSON` secret (through stdin, so it works in PowerShell too) and records the date in the `NOTEBOOKLM_AUTH_UPDATED` repository variable.
-4. Starts the workflow, watches it to the end and says whether it succeeded. A renewal is done when a run succeeds, not when the secret is set.
+1. 手元の notebooklm CLI を `requirements-notebooklm.txt` の版に合わせます。ログインは手元で行うので、手元の CLI が古いと、CI の版ではもう直っているログインの不具合を繰り返すからです。
+2. 前の `storage_state.json` を消し、`notebooklm -p ci login --fresh` を実行します（`--fresh` はプロファイルのブラウザのセッションを消しますが、このファイルは残すので、別に消しています）。次に、新しい認証情報を `notebooklm -p ci auth check --test --passive` で確かめます。これは Cookie を更新せず、ファイルも書き換えない、読み取りだけの確認です。確認に失敗したら、何もアップロードしません。
+3. ファイルを `NOTEBOOKLM_AUTH_JSON` シークレットに流し込み（標準入力を通すので PowerShell でも動きます）、日付をリポジトリの変数 `NOTEBOOKLM_AUTH_UPDATED` に記録します。
+4. ワークフローを開始して最後まで見届け、成功したかどうかを伝えます。更新が終わるのは、シークレットを設定したときではなく、実行が成功したときです。
 
-The manual equivalent:
+手でやる場合:
 
 ```bash
 uv tool install --force "$(grep -E '^notebooklm-py' requirements-notebooklm.txt)"
@@ -42,92 +42,94 @@ gh secret set NOTEBOOKLM_AUTH_JSON < ~/.notebooklm/profiles/ci/storage_state.jso
 gh workflow run rss-radio.yml && gh run watch
 ```
 
-Each step comes from 2026-10-05. The first renewal kept the `ci` browser's expired session and re-saved it, so the new secret failed like the old one. The second used `--fresh` but left the old `storage_state.json` in place; with that file present, notebooklm-py 0.8.0 said "Already logged in" within three seconds on a brand-new browser and saved cookies that could not sign in (reproduced with junk cookies; 0.8.4 waits for the sign-in). Both failures showed up only because someone opened the Actions tab, so the wizard now checks before uploading and watches the run afterwards.
+どの手順も、2026-10-05 の出来事から来ています。1 回目の更新は、`ci` のブラウザに残っていた期限切れのセッションをそのまま保存し直したので、新しいシークレットも古いものと同じように失敗しました。2 回目は `--fresh` を使いましたが、古い `storage_state.json` を残していました。そのファイルがあると、notebooklm-py 0.8.0 はまっさらなブラウザでも 3 秒で「Already logged in」と表示し、ログインできない Cookie を保存しました（でたらめな Cookie で再現しました。0.8.4 はログインを待ちます）。どちらの失敗も、誰かが Actions のタブを開いたから分かったものです。そのため今は、アップロードの前に確かめ、その後の実行も見届けるようにしています。
 
-`python3 scripts/setup.py doctor` shows the credential's age at any time.
+`python3 scripts/setup.py doctor` で、認証情報がいつ作られたかをいつでも確かめられます。
 
-**On `--master-token`.** notebooklm-py 0.8.0 added `notebooklm login --master-token`, a long-lived account-level token meant for cron recovery. Its own source describes it as full-account, durable and "infostealer-grade", to be used with a dedicated throwaway account only. That is a legitimate way to escape the 3.5-week renewal — *if* the radio runs under a throwaway Google account you would not mind losing, which also means a free-tier NotebookLM quota (3 Audio Overviews/day). This project does not use it by default and does not recommend it for your main account.
+**`--master-token` について。** notebooklm-py 0.8.0 は、cron での回復に向けた、長持ちするアカウント単位のトークンを使う `notebooklm login --master-token` を追加しました。notebooklm-py 自身のソースは、これをアカウント全体に効き、長持ちし、「情報窃取マルウェアに狙われる級」のものとし、使い捨ての専用アカウントでだけ使うよう説明しています。3.5 週ごとの更新から逃れる正当な方法ではあります。ただしそれは、失っても困らない使い捨ての Google アカウントでラジオを動かす場合で、そのアカウントの NotebookLM は無料枠（Audio Overview は 1 日 3 回）になります。このプロジェクトは既定では使わず、メインのアカウントでの利用も勧めません。
 
-## How expiry actually presents (an upstream quirk worth knowing)
+## 期限切れの実際の見え方（知っておく価値のある上流の癖）
 
-An expired env-var credential makes the CLI exit **2 / `UNEXPECTED_ERROR`**, not 1 / `AUTH_ERROR` — the expiry lands in the library's unhandled-exception bucket, so the exit code alone looks like a bug, not a credential problem. This exact misdirection cost a 16-day silent outage (see incident log). Two defenses now exist:
+環境変数の認証情報が切れると、CLI は 1 / `AUTH_ERROR` ではなく **2 / `UNEXPECTED_ERROR`** で終わります。期限切れがライブラリの「想定外の例外」に分類されるので、終了コードだけを見ると、認証の問題ではなく不具合に見えます。この取り違えで、16 日間気づかないまま止まっていたことがあります（出来事の記録を参照）。今は 2 つの対策があります。
 
-- `describe_failure` parses the CLI's JSON error envelope from stdout and puts `code` + `message` into the notification, so the text names authentication instead of just "exit 2".
-- When the message matches auth expiry, the notification appends the runbook above verbatim.
+- `describe_failure` が CLI の標準出力から JSON のエラー情報を読み取り、`code` と `message` を通知に入れます。そのため通知は「exit 2」だけでなく、認証のことだと示します。
+- メッセージが認証の期限切れに一致すると、上の手順をそのまま通知に付けます。
 
-Expiry has shown up in two shapes, and `AUTH_EXPIRED_MARKERS` matches both: `Authentication expired or invalid` (a redirect to the Google login page), and `CSRF token not found in HTML. Final URL: https://notebook.google.com/ … This may indicate the page structure has changed.` The second reads like an upstream break, but the same CLI version worked with a freshly logged-in profile. To tell the two apart, run `notebooklm -p ci list --json` locally against the frozen `ci` file (a failing call does not rewrite it): if it fails while your default profile works, it is the credential.
+期限切れは 2 つの形で現れ、`AUTH_EXPIRED_MARKERS` は両方に一致します。1 つは `Authentication expired or invalid`（Google のログインページへのリダイレクト）、もう 1 つは `CSRF token not found in HTML. Final URL: https://notebook.google.com/ … This may indicate the page structure has changed.` です。2 つ目は上流が壊れたように読めますが、同じ版の CLI がログインし直したプロファイルでは動きました。見分けるには、固定した `ci` のファイルを使って、手元で `notebooklm -p ci list --json` を実行します（失敗した呼び出しはファイルを書き換えません）。それが失敗し、default のプロファイルでは動くなら、原因は認証情報です。
 
-## Following notebooklm-py upstream
+## notebooklm-py の更新に追従する
 
-notebooklm-py wraps an unofficial Google API that changes without notice, and its maintainers ship fixes often (0.8.1 to 0.8.4 came out between 08-14 and 10-01). An old pin breaks the batch even when nothing in this repo changed: on 2026-10-05 a renewal failed on a login bug that 0.8.4 had already fixed. The version stays pinned, because this code runs with the session cookie, but the pin is meant to move:
+notebooklm-py は予告なく変わる Google の非公式 API を包んでいて、メンテナーは頻繁に修正を出しています（08-14 から 10-01 のあいだに、0.8.1 から 0.8.4 が出ました）。このリポジトリが何も変わっていなくても、古い版のままだとバッチは壊れます。2026-10-05 には、0.8.4 で直っていたログインの不具合で、更新が失敗しました。このコードはセッションの Cookie と一緒に動くので版は固定したままにしますが、固定した版は動かしていくものです。
 
-- **One place for the version.** `requirements-notebooklm.txt` holds `notebooklm-py[browser]==X`. The workflows and `scripts/setup.py` read it, and a test fails if a workflow hard-codes a version again.
-- **Dependabot proposes updates** (`.github/dependabot.yml`, Mondays 06:00 JST) for that file, the batch's Python packages and the GitHub Actions, one PR each.
-- **`ci.yml` checks every PR** with the tests and `tests/test_cli_contract.py`: the new CLI's `--help` must still list every option the batch, the weekly check and the wizard pass, and accept the audio formats and lengths `config.yaml` allows. It needs no credentials or network, so it runs on Dependabot's PRs. It cannot see JSON shapes or server behaviour; the next run does, and its error notification names the failure.
-- **The weekly check posts a line** (`⬆️ notebooklm-py X が出ている`) when PyPI has a newer version than the pin, so the update does not sit in GitHub's notification inbox.
-- **A human merges.** Read the release notes linked from the PR, merge it, and run the workflow once by hand (`gh workflow run rss-radio.yml`, then `gh run watch`). Your local CLI follows on the next `setup.py renew`.
-- **A copy that merges this template** gets the same Dependabot PRs. Merge the template's PR; the copy's PR closes itself once the merge brings the new version in.
+- **版を書く場所は 1 つだけ。** `requirements-notebooklm.txt` に `notebooklm-py[browser]==X` があります。ワークフローと `scripts/setup.py` はこれを読み、ワークフローがまた版を直接書くとテストが失敗します。
+- **Dependabot が更新を提案します**（`.github/dependabot.yml`、毎週月曜 06:00 JST）。このファイル、バッチの Python パッケージ、GitHub Actions について、それぞれ 1 本の PR です。
+- **`ci.yml` がすべての PR を確かめます。** テストと `tests/test_cli_contract.py` で、新しい CLI の `--help` に、バッチ・週次点検・セットアップが渡すすべてのオプションがまだ載っていて、`config.yaml` が許す音声の形式と長さを受け付けるかを見ます。認証情報もネットワークも要らないので、Dependabot の PR でも動きます。JSON の形やサーバーの動きまでは見えません。それは次の実行で分かり、エラー通知が失敗を伝えます。
+- **週次点検が 1 行知らせます**（`⬆️ notebooklm-py X が出ている`）。PyPI に固定より新しい版があるときで、更新が GitHub の通知に埋もれないようにするためです。
+- **マージするのは人です。** PR にリンクされたリリースノートを読んでマージし、ワークフローを一度手で実行します（`gh workflow run rss-radio.yml` のあと `gh run watch`）。手元の CLI は、次の `setup.py renew` で追従します。
+- **このテンプレートを取り込んでいるコピー** にも、同じ Dependabot の PR が来ます。テンプレート側の PR をマージしてください。コピー側の PR は、取り込みで新しい版が入ると自動で閉じます。
 
-## Secret hygiene (non-negotiable)
+## シークレットの扱い（譲れないこと）
 
-- **Never put raw subprocess stdout/stderr in a notification.** It can carry session cookies, and GitHub's log masking does **not** apply to webhook payloads. `describe_failure` copies only the two known envelope fields (`code`, `message`); everything user-facing additionally passes through `redact()`, which strips the secrets' values and every long string found inside the auth JSON.
-- **The workflow checks out with `persist-credentials: false`.** notebooklm-py is third-party code running with your NotebookLM session in its environment; it must not also be able to reach a git write token. The state push at the end uses an ephemeral authenticated remote instead.
-- **Dependencies are pinned on purpose** (`requirements.txt` exact versions, `requirements-notebooklm.txt`, the setup-uv action pinned by SHA). Bump them deliberately, not implicitly: Dependabot proposes, CI checks, a human merges (see above).
+- **サブプロセスの標準出力・標準エラーをそのまま通知に入れない。** セッションの Cookie が含まれることがあり、GitHub のログのマスクは webhook の送信内容には **効きません**。`describe_failure` は既知の 2 つの項目（`code`、`message`）だけを写し、利用者に見えるものはすべて、さらに `redact()` を通します。`redact()` は、シークレットの値と、認証の JSON の中にある長い文字列をすべて取り除きます。
+- **ワークフローは `persist-credentials: false` でチェックアウトする。** notebooklm-py は、NotebookLM のセッションを環境に持って動く第三者のコードです。git の書き込み用トークンにまで届いてはいけません。最後の state の push には、その場限りの認証付きリモートを使います。
+- **依存関係はわざと固定している**（`requirements.txt` の正確な版、`requirements-notebooklm.txt`、SHA で固定した setup-uv）。上げるときは、暗黙にではなく意図して上げます。Dependabot が提案し、CI が確かめ、人がマージします（上を参照）。
 
-## CI environment gotchas
+## CI 環境の注意点
 
-- **Only `$HOME/.local/bin` goes into `$GITHUB_PATH`.** Adding a uv-internal venv bin path shadows the pip-installed packages and makes `feedparser`/`httpx`/`yaml` unimportable. The workflow's "Verify environment" step exists to catch this regressing.
-- **Cron minutes are deliberately off the half-hour** (`:50`, `:15`) — GitHub's cron is congested at :00/:30 and delays runs.
-- **`state.json` is bot-owned.** CI commits and pushes it after every run (`chore: update state.json [skip ci]`). Never hand-edit or commit it yourself. Deleting it resets every feed to first-run behavior (latest article only, backlog marked read) — that is the recovery of last resort, not a routine action.
-- **Notebook titles use the configured timezone**, because runners are UTC and a `date.today()` would file the morning episode under yesterday.
+- **`$GITHUB_PATH` に入れるのは `$HOME/.local/bin` だけ。** uv 内部の venv の bin を足すと、pip で入れたパッケージが隠れ、`feedparser`/`httpx`/`yaml` を import できなくなります。ワークフローの「環境を確かめる」ステップは、これが再び起きたときに捕まえるためにあります。
+- **cron の分は、わざと 0 分・30 分を避けている**（`:50`、`:15`）。GitHub の cron は 0 分と 30 分に混み、実行が遅れるからです。
+- **`state.json` は bot のもの。** CI が毎回の実行後にコミットして push します（`chore: 既読の記録を更新`）。手で編集したり、自分でコミットしたりしないでください。消すと、すべてのフィードが初回の動きに戻ります（最新の 1 本だけを処理し、過去の記事は既読）。これは最後の手段で、普段やることではありません。
+- **ノートブックのタイトルは、設定したタイムゾーンを使う。** ランナーは UTC なので、`date.today()` では朝の回が前日の日付になります。
 
-## Reading the notifications
+## 通知の読み方
 
-| Signal | Meaning |
+| 合図 | 意味 |
 |---|---|
-| 🎙️ article list | Episode generation **started** (not finished — audio is fire-and-forget). Each topic heading links to its notebook. A heading marked 音声は未生成 means the sources are in but no audio was started for that topic — see the separate error message. |
-| 😪 no news | The run worked; there was nothing new. Silence, by contrast, means breakage. |
-| ⚠️ feed warning | A feed failed to fetch/parse (its read-state was left untouched), or a per-run check fired: every visible entry is unread (older ones may have scrolled out before being processed — raise the limits or use a narrower feed), links point at `#anchors` on one page (use `source_mode: text`), or a sitemap's URLs changed all at once (re-baselined, nothing aired). |
-| ⏭ skipped as stale | Articles older than `settings.max_age_hours`, marked read instead of aired. Listed so nothing disappears silently. |
-| 🗓 weekly check | Sunday: feed health, what aired versus what the feeds published (not aired, aired twice, still pending) and, with `weekly_check.recall`, the Deep Research sweep for announcements no feed carried. Two lines when all is well. A "not aired" article is a loss nobody has explained yet — worth a look. |
-| ⚠️ bot-protection notice | Articles whose content couldn't be ingested; they are *not* in the episode |
-| 🧹 cleanup report | What was (or in dry-run, would be) deleted; a 🧹 削除に失敗 line means cleanup failed and will retry next run |
-| 🚨 gate failure | The test/lint job failed, so the batch did not run at all. Fix the code; there is no episode until it is green. |
-| 🩺 monthly health check | Feeds with no new articles for 30+ days |
-| ⚠️ error + runbook | Something failed; if it's auth expiry, the fix is written in the message. If it says the audio could not be started, the articles are already in the notebook (and marked read) — generate the Audio Overview by hand in the app; `rate_limited` means the daily quota (3 free / 6 Plus / 20 Pro). |
+| 🎙️ 記事の一覧 | 放送の生成を **開始した**（完了ではありません。音声の完了は待ちません）。トピックの見出しは、それぞれのノートブックにリンクしています。見出しに「音声は未生成」とあれば、ソースは入ったが、そのトピックの音声は開始していません。別のエラーメッセージを見てください。 |
+| 😪 新着なし | 実行は動いていて、新しいものがなかった。逆に、何も来ないのは壊れているということです。 |
+| ⚠️ フィードの警告 | フィードの取得や解析に失敗した（既読はそのまま）か、毎回の点検が反応した。点検の内容は、表示されている記事がすべて未読（古い記事が処理前に押し出されたかもしれない。上限を上げるか、狭いフィードにする）、リンクが 1 ページの `#anchor` を指している（`source_mode: text` にする）、サイトマップの URL が一斉に変わった（付け直して何も流していない）、流した（または見送った）記事が新しい ID で現れた（もう一度は流さずに既読にした）、のどれかです。 |
+| ⏭ 鮮度で見送り | `settings.max_age_hours` より古く、流さずに既読にした記事。黙って消えないように一覧にしています。 |
+| 🗓 週次点検 | 日曜に届きます。フィードの健康状態、流したものとフィードが出したものの突き合わせ（流していない、二度流した、まだ待っている）、`weekly_check.recall` があれば、どのフィードにも無い発表の Deep Research による検査です。問題がなければ 2 行です。「流していない」記事は、まだ誰も理由を説明できていない取りこぼしなので、見る価値があります。 |
+| ⚠️ ボット対策の通知 | 中身を取り込めなかった記事。放送には *入っていません*。 |
+| 🧹 削除の報告 | 削除した（dry-run では、削除する予定の）もの。「🧹 削除に失敗」の行は削除が失敗したことを示し、次の回にやり直します。 |
+| 🚨 ゲートの失敗 | テストか lint のジョブが失敗し、バッチがまったく実行されなかった。コードを直してください。緑になるまで放送はありません。 |
+| 🩺 月次の健康診断 | 30 日以上新着のないフィード |
+| ⚠️ エラーと手順 | 何かが失敗した。認証の期限切れなら、直し方がメッセージに書いてあります。音声を開始できなかったとあれば、記事はもうノートブックに入っていて（既読にもなっている）、アプリで手で Audio Overview を作れます。`rate_limited` は 1 日の上限（無料 3 / Plus 6 / Pro 20）です。 |
 
-## Incident log
+## 出来事の記録
 
-The design rationale in this repo is earned. Dates preserved from the original private deployment.
+このリポジトリの設計の理由は、実際の出来事から得たものです。日付は、元の非公開のデプロイのものです。
 
-**2026-07 — the 1,226-article flood.** The original seen-ID read-state, trimmed to stay bounded, forgot entries that were still present in Vercel's 1,325-entry feed. One run re-announced 1,226 "new" articles, then the feed's trimmed halves oscillated between runs indefinitely. Fix: watermark read-state for RSS (`docs/DESIGN.md`). The regression test for this is the first test in the suite.
+**2026-07 — 1,226 本の洪水。** 上限を保つために切り捨てていた最初の既読 ID の一覧が、Vercel の 1,325 件のフィードにまだ載っている記事を忘れました。1 回の実行で 1,226 本を「新着」としてもう一度知らせ、その後はフィードの切り捨てた半分ずつが、回ごとに交互に新着になりました。対策: RSS の既読を透かしにした（`docs/DESIGN.md`）。この回帰テストが、テストの 1 本目です。
 
-**2026-07-13 — the resurrected April article.** Sitemap feeds then used the same watermark logic; an old article's `<lastmod>` was bumped by an edit and it aired as news three months late. Fix: seen-URL sets for sitemaps; `lastmod` is never treated as newness.
+**2026-07-13 — よみがえった 4 月の記事。** 当時はサイトマップも同じ透かしで判定していて、古い記事の `<lastmod>` が編集で新しくなり、3 か月遅れのニュースとして流れました。対策: サイトマップは既読 URL の集合にし、`lastmod` は新着の判定に使わない。
 
-**2026-07 — the shared sitemap key.** Two feeds reading different prefixes of the same sitemap shared one state entry; one feed's articles were silently marked read by the other. Fix: the prefix became part of the state key.
+**2026-07 — サイトマップのキーの共有。** 同じサイトマップの別々のプレフィックスを読む 2 つのフィードが 1 つの state を共有し、一方の記事がもう一方によって黙って既読になりました。対策: プレフィックスを state のキーに含めた。
 
-**2026-07-23 → 2026-08-01 — the first credential expiry.** The initial CI secret lasted about 15 days; every run failed with exit 2 and an error notification, and the cause (expiry) was only understood after the second, worse outage below.
+**2026-07-23 → 2026-08-01 — 最初の認証の期限切れ。** 最初の CI 用のシークレットは約 15 日もちました。毎回の実行が exit 2 とエラー通知で失敗し、原因（期限切れ）が分かったのは、下のもっとひどい障害の後でした。
 
-**2026-08-05 → 2026-08-21 — the 16-day silence.** The frozen CI credential expired; the CLI exited 2/`UNEXPECTED_ERROR`, which read as "some bug" rather than "credentials", and the batch died quietly every day. Fixes: error envelope parsing in notifications, the auth-expiry hint with the runbook, the no-news heartbeat (so silence is always abnormal), and the dedicated `ci` profile (the first replacement secret, shared with the default profile, died in 3 days).
+**2026-08-05 → 2026-08-21 — 16 日間の沈黙。** 固定した CI 用の認証情報が切れ、CLI は 2/`UNEXPECTED_ERROR` で終わりました。それが「認証情報」ではなく「何かの不具合」に見え、バッチは毎日静かに止まっていました。対策: 通知でのエラー情報の読み取り、手順付きの期限切れの案内、新着なしの合図（何も来ないことが必ず異常になるように）、専用の `ci` プロファイル（default のプロファイルと共有した最初の代わりのシークレットは、3 日で切れました）。
 
-**2026-08-11 → 08-13 and 2026-08-21 → 08-30 — the silent gate.** The batch job depends on the test job. A date-dependent test, then three lint errors in files the batch does not even use, failed the gate for 25 runs; the batch never ran, so there was no error notification and no heartbeat — the one kind of silence the heartbeat was meant to make impossible. Fix: the test job now posts a 🚨 message to the webhook when it fails.
+**2026-08-11 → 08-13 と 2026-08-21 → 08-30 — 黙ったゲート。** バッチのジョブは、テストのジョブに依存しています。日付に依存したテスト、次にバッチが使ってもいないファイルの lint エラー 3 件で、25 回ゲートが失敗しました。バッチは一度も動かず、エラー通知も新着なしの合図も出ませんでした。新着なしの合図でなくすはずだった、まさにその種類の沈黙です。対策: テストのジョブが失敗したら、webhook に 🚨 のメッセージを送る。
 
-**2026-08 — state lost on failed runs.** The state-push step only ran when the batch succeeded, but `main()` saves read-state for the topics that succeeded before exiting non-zero. During the auth outage the same 11 watch-page updates were re-announced on every failed run. Fix: the push step runs whenever the batch step ran, success or failure.
+**2026-08 — 失敗した回の state が失われた。** state を push するステップは、バッチが成功したときだけ動いていました。ところが `main()` は、0 以外で終わる前に、成功したトピックの既読を保存しています。認証の障害のあいだ、同じ 11 件のページ更新の通知が、失敗した回のたびに繰り返されました。対策: バッチのステップが動いたなら、成功でも失敗でも push のステップを動かす。
 
-**2026-09-22 — the same-timestamp loss.** Cloudflare Changelog published 7 entries in one day; date-only feeds give them all the same midnight timestamp. The per-feed limit processed 3, and the other 4 were recorded as read because the code treated *every* entry at the watermark time as a tie. Fix: an entry at the watermark time is unread unless its ID was actually processed (`docs/DESIGN.md`).
+**2026-09-22 — 同じ時刻による取りこぼし。** Cloudflare Changelog が 1 日に 7 本を出しました。日付だけのフィードでは、どれも同じ真夜中の時刻になります。フィードごとの上限で 3 本を処理し、残りの 4 本は既読として記録されました。コードが、透かしと同じ時刻の記事を *すべて* 同着として扱っていたからです。対策: 透かしと同じ時刻の記事は、その ID を実際に処理していない限り未読（`docs/DESIGN.md`）。
 
-**2026-09 — the Vercel double.** `vercel.com/blog/feed` and `vercel.com/atom` return identical content. Every Vercel article was added as two sources, listed twice, and used two of the 15 per-run slots, on 26 of 27 runs with articles. Fix: cross-feed URL deduplication; both feeds still advance.
+**2026-09 — Vercel の二重。** `vercel.com/blog/feed` と `vercel.com/atom` は同じ中身を返します。記事のあった 27 回のうち 26 回で、Vercel の記事が 2 つのソースとして追加され、2 回並び、1 回 15 本の枠を 2 つ使いました。対策: フィードをまたいで URL で重複を除く。両方のフィードの既読は進む。
 
-**2026-08-20 → 09-13 — the starved window.** After the credential outage, several feeds had a backlog of old articles, and the per-run total (15) was filled strictly oldest-first. GitHub Changelog shows only its newest 10 items (about a day); it had 10 unread items on every run from 09-01 to 09-13, got zero slots in 30 capped runs, and 101 of its 152 posts scrolled out of the feed before being processed (Google Cloud lost 32 the same way, 135 in total). Fix: the total cap is filled by how close an article is to scrolling out of its feed, then by age.
+**2026-08-20 → 09-13 — 枠をもらえなかった期間。** 認証の障害の後、いくつかのフィードに古い記事が溜まり、1 回の全体の上限（15）が厳密に古い順で埋められていました。GitHub Changelog は新しい 10 件（およそ 1 日分）しか表示しません。09-01 から 09-13 のすべての回で未読が 10 件あり、上限で切られた 30 回で枠を 1 つも得られず、152 本中 101 本が処理される前にフィードから押し出されました（Google Cloud も同じように 32 本、合わせて 135 本）。対策: 全体の上限は、フィードから押し出されるまでの近さ、次に古さの順で埋める。
 
-**2026-09 — backdated late arrivals.** Feeds insert items dated earlier than items they have already published (OpenAI on 09-23: seven posts dated 01:00–12:00 appeared after a 13:00 post had been processed; Cloudflare's changelog back-fills entries up to two days late). Each was older than the watermark on arrival and was read without being processed — 37 in September. Fix: a 7-day lookback below the watermark, gated by a record of every processed ID.
+**2026-09 — 前の日付で遅れて現れる記事。** フィードは、すでに出した記事より前の日付の記事を、後から差し込みます（09-23 の OpenAI: 13:00 の記事を処理した後に、01:00〜12:00 の日付の記事が 7 本現れた。Cloudflare の changelog は最大 2 日遅れで項目を足す）。どれも現れた時点で透かしより古く、処理されないまま既読になりました。9 月に 37 本です。対策: 透かしから 7 日の振り返り。処理したすべての ID の記録と組み合わせる。
 
-**2026-09 — re-dated articles aired twice.** Vercel re-dated an edited post, which re-crossed the watermark and aired again three days later; Claude Code's what's-new feed changed an old week's date (and its content-hash GUID) and aired it as new. Fix: every processed ID is remembered (the what's-new feed also moved to per-week pages read from the sitemap).
+**2026-09 — 日付を付け直された記事の二重放送。** Vercel が編集した記事の日付を付け直し、その記事が透かしをまた越えて、3 日後にもう一度流れました。Claude Code の what's new のフィードは、古い週の日付（と、中身のハッシュでできた GUID）を変え、新着として流れました。対策: 処理した ID はすべて覚える（what's new のフィードも、サイトマップから読む週ごとのページに移した）。
 
-**2026-09-29 — the trailing slash.** antigravity.google changed its sitemap URLs to end in `/`. None matched the stored seen-set, so all 24 posts looked new, one old post aired, and the seen-set was overwritten with the single aired URL. The feed was paused the same day. Fix: seen-set comparison ignores a trailing slash, and a sitemap where more than half the URLs turn unread at once is re-baselined with a warning instead of aired.
+**2026-09-29 — 末尾の /。** antigravity.google が、サイトマップの URL を `/` で終わる形に変えました。保存していた既読の集合とどれも一致せず、24 本すべてが新着に見え、古い記事が 1 本流れ、既読の集合はその 1 本の URL だけで上書きされました。フィードは同じ日に止めました。対策: 既読の集合の照合では末尾の / を無視し、URL の半分以上が一度に未読になったサイトマップは、流さずに警告を出して付け直す。
 
-**2026-09 — anchor-linked changelogs imported whole pages.** The Codex changelog links every entry to a `#fragment` of one ~1.4 MB page; NotebookLM imports the page, so 42 adds in a month were 21+ copies of the entire history (three in one notebook). Fix: `source_mode: text` submits each entry's own text, labeled as the feed's body rather than as a summary.
+**2026-09 — # 位置にリンクする changelog が、ページ全体を取り込んだ。** Codex の changelog は、すべての項目を約 1.4 MB の 1 ページの `#fragment` にリンクしています。NotebookLM はそのページを取り込むので、1 か月の 42 回の追加は、履歴全体の 21 回以上のコピーでした（1 冊に 3 つ）。対策: `source_mode: text` で各項目のテキストを投入し、要約ではなくフィードの本文だと明記する。
 
-**2026-09 — audio failure left articles unread.** If `generate audio` failed after the sources were added, the topic counted as failed and its articles stayed unread, so the next run re-added the same URLs. Fix: those articles are marked read and the failure is reported separately with the CLI's error code, so a daily-quota rejection (`rate_limited`) is visible instead of an opaque exit code.
+**2026-09 — 音声の失敗で、記事が未読のまま残った。** ソースを追加した後に `generate audio` が失敗すると、そのトピックは失敗扱いで記事が未読のまま残り、次の回に同じ URL をまた追加していました。対策: そうした記事は既読にし、失敗は CLI のエラーコード付きで別に知らせる。1 日の上限による拒否（`rate_limited`）が、意味の分からない終了コードではなく見えるようにするためです。
 
-**2026-10-02 → 10-05 — expiry in disguise.** The `ci` secret from 08-21 lasted about 41 days, then every run failed with `UNEXPECTED_ERROR: CSRF token not found in HTML … the page structure has changed`. The auth hint matched only `Authentication expired or invalid`, so the notification carried no runbook and read like an upstream break. With the 72-hour cutoff, the outage's older articles were marked read unaired. Fix: the CSRF message also counts as expiry, and the hint now leads with `python3 scripts/setup.py renew`. The renewal itself then failed twice: the first re-saved the expired session from the `ci` profile's cached browser, and the second (with `--fresh`) was skipped by notebooklm-py 0.8.0 because the old `storage_state.json` was still there. Each uploaded secret failed like the old one, and only the Actions tab showed it. Fixes: notebooklm-py 0.8.4, which waits for the sign-in; renew matches the local CLI to the pin, deletes the old file, checks the credential before uploading and watches the run; and the pin now follows upstream (Dependabot, the CLI contract test, the weekly line).
+**2026-10-02 → 10-05 — 姿を変えた期限切れ。** 08-21 の `ci` のシークレットは約 41 日もった後、毎回 `UNEXPECTED_ERROR: CSRF token not found in HTML … the page structure has changed` で失敗するようになりました。認証の案内は `Authentication expired or invalid` にしか一致しなかったので、通知に手順が付かず、上流が壊れたように読めました。72 時間の足切りがあるため、障害のあいだの古い記事は流されずに既読になりました。対策: CSRF のメッセージも期限切れとして扱い、案内の先頭に `python3 scripts/setup.py renew` を置く。更新そのものも 2 回失敗しました。1 回目は `ci` プロファイルのブラウザに残っていた期限切れのセッションを保存し直し、2 回目（`--fresh` あり）は、古い `storage_state.json` が残っていたため、notebooklm-py 0.8.0 がログインを飛ばしました。アップロードしたシークレットはどちらも古いものと同じように失敗し、それが分かったのは Actions のタブだけでした。対策: ログインを待つ notebooklm-py 0.8.4。手元の CLI を固定の版に合わせ、古いファイルを消し、アップロードの前に確かめ、実行を見届ける renew。そして、固定の版を上流に追従させる仕組み（Dependabot、CLI の契約テスト、週次の 1 行）。
+
+**2026-10-09 — ID だけを付け直された changelog。** Claude Code の changelog が既存の版の GUID を付け直し（2 つは日付も）、2.1.292 と 2.1.293 が二度流れ、見送っていた 2.1.287 が 1 週間遅れで流れ、放送済みの 4 つの版が見送り通知に載りました。週次点検も、1 ページの `#anchor` で版を分ける changelog の別々の版を「二度流した」と数えていました。対策: 実行記録にある URL は、新しい ID で現れても扱い済みにする。週次点検は版ごとに数える（`docs/DESIGN.md`）。

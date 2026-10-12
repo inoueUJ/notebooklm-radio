@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/inoueUJ/notebooklm-radio/config.schema.json",
   "title": "notebooklm-radio config.yaml",
-  "description": "Shape of config.yaml. The runtime enforces the same rules in validate_config() (python radio_batch.py --check-config); the config builder generates files that satisfy this schema. Unknown keys are errors, because a typo that silently falls back to a default is the worst failure mode.",
+  "description": "config.yaml の形。実行時も validate_config()（python radio_batch.py --check-config）で同じルールを確かめ、設定ビルダーはこのスキーマを満たすファイルを作ります。未知のキーはエラーです。打ち間違いが黙って既定値に戻るのが、いちばん悪い失敗の仕方だからです。",
   "type": "object",
   "additionalProperties": false,
   "required": ["feeds"],
@@ -10,20 +10,20 @@
     "feeds": {
       "type": "array",
       "minItems": 1,
-      "description": "Feeds to turn into radio. Each feed belongs to exactly one topic; the same feed URL may not appear twice (sitemaps may, with different prefixes).",
+      "description": "ラジオにするフィード。各フィードはちょうど 1 つのトピックに属します。同じフィードの URL は 2 回書けません（サイトマップは、プレフィックスが違えば書けます）。",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["name", "url"],
         "properties": {
-          "name": { "type": "string", "minLength": 1, "description": "Display name used in notifications." },
-          "url": { "type": "string", "format": "uri", "description": "RSS/Atom feed URL, or a sitemap.xml URL when type is sitemap." },
+          "name": { "type": "string", "minLength": 1, "description": "通知に出る名前。" },
+          "url": { "type": "string", "format": "uri", "description": "RSS/Atom フィードの URL。type が sitemap なら sitemap.xml の URL。" },
           "type": { "type": "string", "enum": ["rss", "sitemap"], "default": "rss" },
-          "prefix": { "type": "string", "description": "Required for sitemap feeds: only URLs starting with this prefix are treated as articles. Also part of the read-state key, so two feeds may share one sitemap with different prefixes." },
-          "topic": { "type": "string", "description": "Which daily notebook the articles go to. One notebook and one Audio Overview per topic per run. Defaults to settings.default_topic." },
-          "source_mode": { "type": "string", "enum": ["url", "text"], "default": "url", "description": "text: submit the feed item's own text as a text source instead of the URL, for hosts that block NotebookLM's fetcher with a bot challenge and for changelogs whose links are #anchors on one long page (by URL, NotebookLM imports the whole page for every entry). The source carries the full body when the feed has one (content:encoded / Atom content); otherwise it is the summary and says so." },
-          "categories": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "Keep only items tagged with at least one of these RSS/Atom categories (case-insensitive), e.g. [\"Product\", \"Research\"] for a feed that mixes launches with company news. Other items are ignored entirely (never candidates, never part of read-state). Ignored for sitemap feeds." },
-          "mode": { "type": "string", "enum": ["backlog", "latest"], "default": "backlog", "description": "backlog: process unread articles oldest-first, carrying overflow to the next run (never drops anything). latest: take only the newest N (settings.limits.per_feed) and deliberately mark the rest read — for aggregators and other firehoses where 'today's top' matters more than completeness. Ignored for sitemaps." }
+          "prefix": { "type": "string", "description": "サイトマップのフィードでは必須。このプレフィックスで始まる URL だけを記事として扱います。既読の state のキーにも含まれるので、2 つのフィードがプレフィックスを変えて 1 つのサイトマップを共有できます。" },
+          "topic": { "type": "string", "description": "記事を入れる日ごとのノートブック。トピックごとに 1 日 1 冊のノートブックを使い、実行ごとに 1 本の Audio Overview を作ります。省略すると settings.default_topic になります。" },
+          "source_mode": { "type": "string", "enum": ["url", "text"], "default": "url", "description": "text: URL の代わりに、フィードの項目のテキストをテキストのソースとして投入します。ボット確認で NotebookLM の取得をブロックするホストと、1 つの長いページの #位置にリンクする changelog（URL で渡すと、NotebookLM は項目ごとにページ全体を取り込みます）のための設定です。フィードに本文があれば（content:encoded / Atom の content）ソースは本文の全文になり、なければ要約になって、そのことをソースに明記します。" },
+          "categories": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "これらの RSS/Atom のカテゴリのどれかが付いた項目だけを残します（大文字と小文字は区別しません）。例: 新製品と会社のニュースが混ざったフィードなら [\"Product\", \"Research\"]。ほかの項目は完全に無視します（候補にも、既読の state にも入りません）。サイトマップのフィードでは無視されます。" },
+          "mode": { "type": "string", "enum": ["backlog", "latest"], "default": "backlog", "description": "backlog: 未読の記事を古い順に処理し、あふれた分は次の回に持ち越します（何も捨てません）。latest: 最新の N 本（settings.limits.per_feed）だけを取り、残りはわざと既読にします。網羅より「今日の注目」が大事な、アグリゲータなどの流量の多いフィード向けです。サイトマップでは無視されます。" }
         },
         "if": { "properties": { "type": { "const": "sitemap" } }, "required": ["type"] },
         "then": { "required": ["prefix"] }
@@ -31,7 +31,7 @@
     },
     "topics": {
       "type": "object",
-      "description": "Per-topic overrides, keyed by topic name (the same strings used in feeds[].topic). Topic names listed here are also recognized by cleanup even after their feeds are removed.",
+      "description": "トピックごとの上書き。キーはトピック名（feeds[].topic と同じ文字列）です。ここに書いたトピック名は、フィードを外した後も、古いノートブックの削除で認識されます。",
       "additionalProperties": {
         "type": ["object", "null"],
         "additionalProperties": false,
@@ -43,24 +43,24 @@
     "weekly_check": {
       "type": "object",
       "additionalProperties": false,
-      "description": "The weekly check (scripts/weekly_check.py, .github/workflows/weekly-check.yml) always reports feed health and aired-vs-published reconciliation. These keys add the optional Deep Research sweep.",
+      "description": "週次点検（scripts/weekly_check.py、.github/workflows/weekly-check.yml）は、フィードの健康状態と、流したものとフィードが出したものの突き合わせを毎回知らせます。ここのキーで、任意の Deep Research による検査を足します。",
       "properties": {
-        "recall": { "type": "boolean", "default": false, "description": "Once a week, let NotebookLM's Deep Research look for official announcements from the past 7 days and list those on sites you follow that no feed carried. Uses one Deep Research a week; the notebook it creates (topic 'Recall') is cleaned up like the others." },
-        "recall_query": { "type": "string", "minLength": 1, "description": "The question to research. {start} and {end} become the week's dates. Defaults to one built from the feed names." }
+        "recall": { "type": "boolean", "default": false, "description": "週に 1 回、NotebookLM の Deep Research に過去 7 日の公式発表を探させ、購読しているサイトにあるのに、どのフィードにも載らなかったものを並べます。Deep Research を週に 1 回使います。作るノートブック（トピック 'Recall'）は、ほかと同じように削除されます。" },
+        "recall_query": { "type": "string", "minLength": 1, "description": "調べさせる問い。{start} と {end} は、その週の日付になります。省略すると、フィードの名前から作ります。" }
       }
     },
     "watch": {
       "type": "array",
-      "description": "Notification-only page monitoring (never becomes radio). Watches a sitemap for new URLs and changed <lastmod> under a prefix.",
+      "description": "通知だけのページの見張り（ラジオにはしません）。サイトマップのプレフィックスの下で、新しい URL と変わった <lastmod> を見ます。",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["name", "url", "prefix"],
         "properties": {
           "name": { "type": "string", "minLength": 1 },
-          "url": { "type": "string", "format": "uri", "description": "sitemap.xml URL." },
+          "url": { "type": "string", "format": "uri", "description": "sitemap.xml の URL。" },
           "prefix": { "type": "string" },
-          "keywords": { "type": "array", "items": { "type": "string" }, "description": "Case-insensitive substrings matched against the page URL. Empty means every page under the prefix." }
+          "keywords": { "type": "array", "items": { "type": "string" }, "description": "ページの URL と照らし合わせる部分文字列（大文字と小文字は区別しません）。空なら、プレフィックスの下のすべてのページ。" }
         }
       }
     },
@@ -68,32 +68,32 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "notebook_title_format": { "type": "string", "default": "Tech Radio {date}", "pattern": "\\{date\\}", "description": "Must contain {date}; may contain {topic}. Cleanup deletes only notebooks whose title fully matches this format, so it must never match a hand-made notebook." },
-        "language": { "type": "string", "default": "ja", "description": "Audio Overview language (any language NotebookLM supports)." },
-        "timezone": { "type": "string", "default": "Asia/Tokyo", "description": "IANA timezone for notebook dates and monthly checks. Runners are UTC." },
+        "notebook_title_format": { "type": "string", "default": "Tech Radio {date}", "pattern": "\\{date\\}", "description": "{date} を必ず含み、{topic} を含めてもかまいません。古いノートブックの削除は、タイトルがこの形式に完全に一致するものだけが対象なので、手で作ったノートブックに一致してはいけません。" },
+        "language": { "type": "string", "default": "ja", "description": "Audio Overview の言語（NotebookLM が対応している言語ならどれでも）。" },
+        "timezone": { "type": "string", "default": "Asia/Tokyo", "description": "ノートブックの日付と月次の点検に使う IANA のタイムゾーン。ランナーは UTC です。" },
         "default_topic": { "type": "string", "default": "AI" },
         "limits": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "per_feed": { "type": "integer", "minimum": 1, "default": 3, "description": "Articles per feed per run." },
-            "total": { "type": "integer", "minimum": 1, "default": 15, "description": "Articles per run across all feeds. Sources are waited on serially; raising this eats into the 30-minute job timeout." }
+            "per_feed": { "type": "integer", "minimum": 1, "default": 3, "description": "1 回の実行で、フィードごとに扱う記事の数。" },
+            "total": { "type": "integer", "minimum": 1, "default": 15, "description": "1 回の実行で、すべてのフィードを合わせて扱う記事の数。ソースは 1 本ずつ順に待つので、上げるとジョブの 30 分の制限時間を食います。" }
           }
         },
-        "user_agent": { "type": "string", "description": "User-Agent sent when fetching feeds. Point it at your own repository." },
-        "audio": { "$ref": "#/$defs/audio", "description": "Global Audio Overview settings; topics.<name>.audio overrides them per topic." },
+        "user_agent": { "type": "string", "description": "フィードを取得するときに送る User-Agent。自分のリポジトリを指してください。" },
+        "audio": { "$ref": "#/$defs/audio", "description": "Audio Overview の全体の設定。topics.<name>.audio が、トピックごとに上書きします。" },
         "cleanup": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean", "default": false },
             "retention_days": { "type": "integer", "minimum": 1, "default": 7 },
-            "dry_run": { "type": "boolean", "default": true, "description": "Post the would-delete list instead of deleting. Keep true until the list has been observed to be correct." },
-            "legacy_title_formats": { "type": "array", "items": { "type": "string", "pattern": "\\{date\\}" }, "description": "Retired title formats whose notebooks should still be cleaned up." }
+            "dry_run": { "type": "boolean", "default": true, "description": "削除せずに、削除対象の一覧を知らせます。一覧が正しいことを確かめるまでは true のままにしてください。" },
+            "legacy_title_formats": { "type": "array", "items": { "type": "string", "pattern": "\\{date\\}" }, "description": "以前使っていたタイトルの形式。そのノートブックも、削除の対象にします。" }
           }
         },
-        "stale_feed_days": { "type": "integer", "minimum": 1, "default": 30, "description": "On the 1st of each month, report feeds with no new articles for this many days." },
-        "max_age_hours": { "type": "integer", "minimum": 1, "description": "Do not air articles published more than this many hours ago: mark them read and list them in one notification. Off when absent. Applies to dated RSS/Atom entries (sitemaps and undated entries are never considered stale); a feed's first run never counts as skipping." }
+        "stale_feed_days": { "type": "integer", "minimum": 1, "default": 30, "description": "毎月 1 日に、この日数のあいだ新着がないフィードを知らせます。" },
+        "max_age_hours": { "type": "integer", "minimum": 1, "description": "公開からこの時間より経った記事は流さず、既読にして 1 通の通知に並べます。書かなければ無効です。日付のある RSS/Atom の項目が対象で（サイトマップと日付のない項目は、古いと判定しません）、フィードの初回は見送りに数えません。" }
       }
     }
   },
@@ -102,11 +102,11 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
-        "format": { "type": "string", "enum": ["deep-dive", "brief", "critique", "debate"], "description": "Conversation style. NotebookLM's default is deep-dive." },
+        "format": { "type": "string", "enum": ["deep-dive", "brief", "critique", "debate"], "description": "会話の形式。NotebookLM の既定は deep-dive です。" },
         "length": { "type": "string", "enum": ["short", "default", "long"] },
-        "prompt": { "type": "string", "description": "Style/focus instructions passed to the Audio Overview customization. Write it in the same language as `language`." },
-        "language": { "type": "string", "description": "Per-topic language override (only meaningful under topics.<name>.audio)." },
-        "scope": { "type": "string", "enum": ["run", "notebook"], "default": "run", "description": "run: generate from the sources added in this run only, so the second run of a day covers only its own articles. notebook: generate from every source in the notebook." }
+        "prompt": { "type": "string", "description": "Audio Overview のカスタマイズに渡す、話し方や焦点の指示。`language` と同じ言語で書いてください。" },
+        "language": { "type": "string", "description": "トピックごとの言語の上書き（topics.<name>.audio の中でだけ意味があります）。" },
+        "scope": { "type": "string", "enum": ["run", "notebook"], "default": "run", "description": "run: この回に追加したソースだけから生成するので、1 日の 2 回目の回は、その回の記事だけを扱います。notebook: ノートブックのすべてのソースから生成します。" }
       }
     }
   }

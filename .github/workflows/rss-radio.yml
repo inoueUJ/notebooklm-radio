@@ -2,24 +2,22 @@ name: RSS Radio Automation
 
 on:
   schedule:
-    # Pick times that fit YOUR morning (times below assume Asia/Tokyo, UTC+9):
-    # the morning run collects announcements published overnight, early enough
-    # that audio generation (~20 min) finishes before you start listening.
-    # GitHub starts scheduled runs late when it is busy, sometimes by hours: since
-    # 2026-09 the author's runs have started 1.5–2.5 h late in the JST early morning
-    # and 3.5–8.5 h late in the JST afternoon. Schedule well before you listen; an
-    # on-time start is merely early. A manual run (workflow_dispatch) is not delayed.
-    # Avoid :00/:30 exactly — GitHub's cron is congested there and runs get delayed.
-    - cron: '50 21 * * *'  # 06:50 JST — catches overnight (US daytime) announcements
-    - cron: '15 8 * * *'   # 17:15 JST — catches JP/EU daytime announcements
-  workflow_dispatch:       # manual runs
+    # 自分の朝に合う時刻を選ぶ（下の時刻は Asia/Tokyo、UTC+9 で考えている）。
+    # 朝の回は、夜のあいだに出た発表を集める。音声の生成（約 20 分）が聞き始める前に
+    # 終わるよう、早めにする。
+    # GitHub は混んでいると定時の実行を遅らせ、数時間遅れることもある。2026-09 以降、作者の
+    # 実行は日本時間の早朝で 1.5〜2.5 時間、午後で 3.5〜8.5 時間遅れて始まっている。聞く時刻より
+    # かなり前に設定すること（定時に始まれば、早く終わるだけ）。手動実行（workflow_dispatch）は遅れない。
+    # ちょうど 0 分・30 分は避ける。GitHub の cron はそこが混み、実行が遅れる。
+    - cron: '50 21 * * *'  # 06:50 JST — 夜のあいだ（米国の昼）の発表を拾う
+    - cron: '15 8 * * *'   # 17:15 JST — 日本・欧州の昼の発表を拾う
+  workflow_dispatch:       # 手動実行
 
-# Read-only by default; only the job that pushes state.json gets write access.
+# 既定は読み取りだけ。state.json を push するジョブだけが書き込みの権限を持つ。
 permissions:
   contents: read
 
-# A manual run overlapping a cron run would double-generate the radio and race
-# on the state.json push.
+# 手動実行と定時の実行が重なると、ラジオを二重に作り、state.json の push も取り合いになる。
 concurrency:
   group: rss-radio
   cancel-in-progress: false
@@ -39,35 +37,34 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install dev dependencies
+      - name: 開発用の依存関係を入れる
         run: pip install -r requirements-dev.txt
 
-      - name: Install uv
+      - name: uv を入れる
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
 
-      - name: Install notebooklm-py (for the CLI contract test)
+      - name: notebooklm-py を入れる（CLI の契約テスト用）
         run: |
-          # Only $HOME/.local/bin goes on PATH (see the batch job below).
+          # PATH に足すのは $HOME/.local/bin だけ（下のバッチのジョブを参照）。
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           uv tool install "$(grep -E '^notebooklm-py' requirements-notebooklm.txt)"
 
-      - name: Lint
+      - name: lint
         run: |
           ruff check .
           ruff format --check .
 
-      - name: Test
+      - name: テスト
         run: pytest -q
 
-      - name: Validate config.yaml
-        # Read-only: no network, no NotebookLM, no state.json. A typo in config.yaml
-        # stops here with a readable message instead of silently falling back to
-        # defaults inside the batch.
+      - name: config.yaml を検査する
+        # 読み取りだけ: ネットワーク・NotebookLM・state.json には触らない。config.yaml の打ち間違いは、
+        # バッチの中で黙って既定値に戻るのではなく、ここで読めるメッセージを出して止まる。
         run: python radio_batch.py --check-config
 
-      - name: Notify on test/lint failure
-        # Without this, a failing gate skips the batch silently: no radio and no
-        # message at all (25 runs went missing this way in 2026-08).
+      - name: テスト・lint の失敗を知らせる
+        # これがないと、ゲートが失敗したときにバッチが黙って飛ばされ、ラジオもメッセージも
+        # 何も届かない（2026-08 に 25 回分がこうして消えた）。
         if: failure()
         env:
           NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
@@ -88,71 +85,70 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write  # needed to push state.json back to the repository
+      contents: write  # state.json をリポジトリに push するために必要
 
     steps:
-      - name: Check required secrets
+      - name: 必要なシークレットを確かめる
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
           NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
         run: |
-          # Fail fast with a readable message instead of an opaque CLI error later.
+          # 後で分かりにくい CLI のエラーになる前に、読めるメッセージですぐに止める。
           if [ -z "$NOTEBOOKLM_AUTH_JSON" ]; then
-            echo "::error::The NOTEBOOKLM_AUTH_JSON secret is not set. Locally run: python3 scripts/setup.py  (see README Quick start)"
+            echo "::error::NOTEBOOKLM_AUTH_JSON シークレットが設定されていません。手元で python3 scripts/setup.py を実行してください（README のクイックスタートを参照）"
             exit 1
           fi
           if [ -z "$NOTIFY_WEBHOOK_URL" ]; then
-            echo "::warning::The NOTIFY_WEBHOOK_URL secret is not set. The batch will run, but you will get no Slack/Discord notifications — including error reports."
+            echo "::warning::NOTIFY_WEBHOOK_URL シークレットが設定されていません。バッチは動きますが、エラーの報告も含めて Slack/Discord の通知は届きません。"
           fi
-          echo "Secrets OK."
+          echo "シークレットは揃っています。"
 
-      - name: Checkout repository
+      - name: リポジトリを取得する
         uses: actions/checkout@v7
         with:
-          # Do not leave a write token in .git/config while the batch runs:
-          # notebooklm-py is third-party code running in the same process tree
-          # and could read it.
+          # バッチの実行中に、書き込み用のトークンを .git/config に残さない。
+          # notebooklm-py は同じプロセスツリーで動く第三者のコードで、それを読めてしまう。
           persist-credentials: false
 
-      - name: Set up Python
+      - name: Python を用意する
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Python の依存関係を入れる
         run: pip install -r requirements.txt
 
-      - name: Install uv
+      - name: uv を入れる
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
 
-      - name: Install notebooklm-py
+      - name: notebooklm-py を入れる
         run: |
-          # The notebooklm command lands in ~/.local/bin.
-          # NEVER add uv's internal venv bin to PATH — it shadows the pip-installed
-          # packages above and makes feedparser/httpx/yaml unimportable.
+          # notebooklm コマンドは ~/.local/bin に入る。
+          # uv 内部の venv の bin を PATH に足さないこと。上で pip が入れたパッケージが隠れて、
+          # feedparser/httpx/yaml を import できなくなる。
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          # The version lives in requirements-notebooklm.txt (Dependabot bumps it there).
+          # 版は requirements-notebooklm.txt にある（Dependabot はそこを上げる）。
           uv tool install "$(grep -E '^notebooklm-py' requirements-notebooklm.txt)"
 
-      - name: Verify environment
+      - name: 環境を確かめる
         run: |
-          # Guards against the PATH-shadowing regression described above.
-          python -c "import feedparser, yaml, httpx; print('pip deps OK')"
+          # 上に書いた PATH の隠れが、再び起きていないかを確かめる。
+          python -c "import feedparser, yaml, httpx; print('pip の依存関係 OK')"
           command -v notebooklm
 
-      - name: Run batch script
+      - name: バッチを実行する
         id: batch
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
           NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
         run: python radio_batch.py
 
-      - name: Commit and push state.json if updated
-        # Also runs when the batch failed: main() has already saved read-state for the
-        # topics that succeeded before exiting non-zero. Skipping the push here re-sent
-        # the same watch notifications and re-processed the successful topic on every
-        # failed run. Not on cancel, and not when the batch never ran.
+      - name: state.json が変わっていればコミットして push する
+        # バッチが失敗したときも動かす。main() は 0 以外で終わる前に、成功したトピックの既読を
+        # 保存している。ここで push を飛ばすと、失敗した回のたびに同じページ更新の通知を送り直し、
+        # 成功したトピックも処理し直していた。キャンセルされたときと、バッチが動かなかったときは動かさない。
+        # bot の push は GITHUB_TOKEN で行うので、ワークフローを起動しない（[skip ci] は要らない）。
         if: ${{ !cancelled() && (steps.batch.outcome == 'success' || steps.batch.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -161,10 +157,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
           if git diff --staged --quiet; then
-            echo "state.json unchanged. Nothing to push."
+            echo "state.json は変わっていないので、push するものはありません。"
             exit 0
           fi
-          git commit -m "chore: update state.json [skip ci]"
+          git commit -m "chore: 既読の記録を更新"
           REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git pull --rebase "$REMOTE" "${GITHUB_REF_NAME}"
           git push "$REMOTE" "HEAD:${GITHUB_REF_NAME}"

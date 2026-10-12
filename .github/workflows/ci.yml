@@ -1,9 +1,8 @@
 name: CI
 
-# Lint, tests and the notebooklm CLI contract on every push and pull request, Dependabot's
-# version bumps included. The batch workflow runs the same checks before each run, but only
-# on its schedule, so an update PR would otherwise go unchecked. Never touches NotebookLM,
-# the webhook or state.json.
+# push と pull request のたびに、lint・テスト・notebooklm CLI の契約を確かめる（Dependabot の
+# 版上げも含む）。バッチのワークフローも毎回同じ検査をするが、定時の実行のときだけなので、
+# これがないと更新の PR が確かめられないまま残る。NotebookLM・webhook・state.json には触らない。
 on:
   push:
     branches: [main]
@@ -27,25 +26,25 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install dev dependencies
+      - name: 開発用の依存関係を入れる
         run: pip install -r requirements-dev.txt
 
-      - name: Install uv
+      - name: uv を入れる
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
 
-      - name: Install notebooklm-py (for the CLI contract test)
+      - name: notebooklm-py を入れる（CLI の契約テスト用）
         run: |
-          # Only $HOME/.local/bin goes on PATH (see rss-radio.yml).
+          # PATH に足すのは $HOME/.local/bin だけ（rss-radio.yml を参照）。
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           uv tool install "$(grep -E '^notebooklm-py' requirements-notebooklm.txt)"
 
-      - name: Lint
+      - name: lint
         run: |
           ruff check .
           ruff format --check .
 
-      - name: Test
+      - name: テスト
         run: pytest -q
 
-      - name: Validate config.yaml
+      - name: config.yaml を検査する
         run: python radio_batch.py --check-config
